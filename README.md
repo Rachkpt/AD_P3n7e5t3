@@ -152,6 +152,13 @@ pip install ldap3 impacket
 
 Python 3.8+. Fonctionne sous Linux (recommandé) et Windows. **La puissance maximale s'obtient sur Kali/Exegol** où tous les outils externes sont là.
 
+### Wordlists incluses
+Le dossier **`wordlists/`** contient `userlist.txt` + `passwordlist.txt` (utiles pour kerbrute / spray, ex. THM *Attacktive Directory*) :
+```bash
+# quand le null/RID est bloqué, on seed la phase 1 avec une userlist :
+python adhunt.py <IP> -d <domaine> --anon --userlist wordlists/userlist.txt
+```
+
 ---
 
 ## Utilisation

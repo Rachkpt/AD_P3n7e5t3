@@ -1,8 +1,10 @@
 # adhunt
 
-**Énumération & pentest Active Directory de A à Z — en une seule commande.**
+**Énumération Active Directory avec un tableau de bord vivant — tu fournis l'IP du DC, il énumère et affiche ce qu'il trouve.**
 
-`adhunt.py` déroule automatiquement les 6 phases d'un pentest AD : découverte réseau → énumération non-authentifiée → attaque de mot de passe → énumération authentifiée → escalade/latéral → rapport. Il **pilote les vrais outils** (netexec, impacket, certipy, kerbrute, bloodhound-python, hashcat) quand ils sont présents, avec des **fallbacks 100 % Python** sinon. Il est **conscient du lockout**, sépare la lecture seule (`--safe`) des actions offensives (`--yes`), et **boucle** automatiquement : chaque nouveau credential trouvé/cracké relance l'énumération jusqu'au Domain Admin.
+**Pas de scan nmap dans l'outil** : tu as déjà scanné, tu donnes l'IP du DC. `adhunt.py` confirme les services AD (LDAP/SMB/Kerberos/DNS), puis **énumère** et remplit un **tableau de bord qui se redessine au fur et à mesure** : `utilisateurs → shares/fichiers sensibles → hashes → mots de passe crackés → credentials`. Il **crack automatiquement** les hashes AS-REP/Kerberoast (hashcat → John) et réinjecte les mots de passe. Il **pilote les vrais outils** (netexec, impacket, certipy, kerbrute, bloodhound-python, hashcat) avec **fallback 100 % Python** sinon.
+
+**L'écran ne montre que les trouvailles** — la progression et les erreurs vont dans `loot/<domaine>/debug.log` (option `--verbose` pour tout voir). Par défaut il **n'attaque pas** : l'escalade offensive (DCSync, ADCS/ESC, RBCD/shadow, DACL, disk hunt) est **derrière `--exploit`**.
 
 > ⚠️ **Usage AUTORISÉ uniquement** : pentest sous mandat, red team, CTF, lab. Reste STRICTEMENT dans le scope de ton engagement. Tu es responsable de ton usage.
 
@@ -26,12 +28,12 @@
 
 | | |
 |---|---|
-| **Une commande** | `python adhunt.py <cible> -d <domaine> -u <user> -p <pass> --all` |
-| **6 phases enchaînées** | découverte → non-auth → spray → auth → escalade → rapport |
-| **Auto-boucle** | nouveau cred (cracké / shadow / RBCD / PKINIT / gMSA) → re-enum → jusqu'au DA |
-| **Pilote + fallback** | utilise nxc/impacket/certipy… si présents, sinon Python pur |
-| **Lockout-aware** | lit la password policy et bride le spray pour **ne jamais locker un compte** |
-| **Sûr par défaut** | `--safe` = lecture seule ; les actions offensives exigent `--yes` |
+| **Une commande** | `python adhunt.py <IP_du_DC> -d <domaine> -u <user> -p <pass>` |
+| **Pas de scan** | tu fournis l'IP du DC ; adhunt confirme juste les services (aucun nmap) |
+| **Tableau de bord vivant** | users → shares → hashes → crack → creds, **se redessine quand il trouve** |
+| **Écran propre** | affiche les trouvailles, **pas les erreurs** (→ `debug.log`, `--verbose` pour tout) |
+| **Crack auto** | AS-REP/Kerberoast crackés (hashcat→John) et mots de passe réinjectés |
+| **Sûr par défaut** | énumère seulement ; l'escalade offensive est derrière **`--exploit`** |
 | **Rapport** | `report.md` priorisé par sévérité + `report.json` + `loot/` |
 
 ---
@@ -39,7 +41,7 @@
 ## La chaîne d'attaque (A → Z)
 
 ```
-Découverte réseau (scan ports AD, repère les DC, SMB signing, clock skew)
+Recon : confirme les services AD sur l'IP fournie (pas de scan nmap)
       │
       ▼
 Users valides (RID cycling, kerbrute) ──► AS-REP roasting ──┐
@@ -69,11 +71,11 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 
 ## Les 6 phases en détail
 
-### Phase 0 — Découverte (réseau, sans creds)
-- **Scan de 42 ports par défaut** (AD + services courants : web, ftp, rpc-http…) ; **`-p-`/`--full`** = 65535 ports via nmap → **ne rate aucun port ouvert** ; **table** PORT/SERVICE/VERSION (nmap -sV)
+### Recon — Confirmation des services (PAS de scan)
+- **Aucun nmap** : tu as déjà scanné et tu donnes l'IP du DC. adhunt teste juste les ports AD connus pour **confirmer** que LDAP/SMB/Kerberos/DNS répondent.
 - **Détection automatique des Domain Controllers**
 - **Sonde SMB2 pur-python** (zéro dépendance) : `signing requis ?` (→ surface de relais NTLM), dialecte, **clock skew Kerberos**
-- rootDSE LDAP anonyme (domaine, forêt, naming contexts) + null session (OS, hostname)
+- rootDSE LDAP anonyme (domaine, forêt, naming contexts) + null session (OS, hostname) → renseigne l'entête du tableau de bord
 
 ### Phase 1 — Énumération non-authentifiée
 - **Password policy** (récupérée AVANT tout spray → seuil de lockout)
@@ -82,7 +84,7 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 - **AS-REP roasting** + **Kerberoast via Guest** (foothold sans creds valides) → **auto-crack** (hashcat→John si pas de GPU)
 - Surface notée : **relais NTLM** (signing off), **LLMNR/NBT-NS poisoning** (Responder), coercition
 
-### Phase 2 — Attaque de mot de passe
+### Phase 2 — Attaque de mot de passe (opt-in : `--spray`)
 - **Password spraying lockout-aware** : bride le nombre d'essais sous le seuil, throttle
 - Wordlist auto (saison+année, **nom de société dérivé du domaine**, mots de passe communs) ou `--passwordlist`
 - **Réutilisation de mot de passe** : rejoue les mdp crackés sur tous les users
@@ -102,7 +104,7 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 - **BloodHound** (collecte + analyse du zip : DCSync, délégation non contrainte, high-value)
 - **Auto-crack** (hashcat → **fallback John si pas de GPU**) des hashes AS-REP/Kerberoast → creds réinjectés
 
-### Phase 4 — Escalade & latéral (exploitation active, `--yes`)
+### Phase 4 — Escalade & latéral (**seulement avec `--exploit`**)
 - **Exploitation des ACL** : `GenericAll` sur un user → **Shadow Credentials** + **Targeted Kerberoast** ; `GenericWrite` sur une machine → **RBCD** ; `WriteDACL` sur le domaine → **dacledit** (auto-DCSync)
 - **PKINIT** : `certipy req` (ESC1) → `certipy auth` → hash NT
 - **Cartographie** des creds sur tous les hôtes (admin local ?) → **RCE** (wmiexec) + commande shell (evil-winrm)
@@ -122,7 +124,7 @@ adhunt **n'est pas** une réimplémentation : il **orchestre** les références 
 
 | Domaine | Outils pilotés | Fallback pur-python |
 |---|---|---|
-| Scan / DC | (scan natif) | ✅ sockets threadés |
+| Confirmation services / DC | (pas de nmap) | ✅ sockets threadés (ports AD only) |
 | SMB signing / clock skew | — | ✅ **sonde SMB2 maison** |
 | Enum SMB/RPC | netexec (nxc), enum4linux-ng, rpcclient | partiel |
 | LDAP | ldap3 | ✅ dump + ACL + LAPS + trusts |
@@ -166,25 +168,23 @@ python adhunt.py <IP> -d <domaine> --anon --userlist wordlists/userlist.txt
 
 ## Utilisation
 
+> Tu as **déjà fait ton nmap** → tu donnes l'IP du DC. adhunt ne scanne pas.
+
 ```bash
-# Découverte d'un subnet (repère les DC, signing, clock skew)
-python adhunt.py 10.10.10.0/24
+# Énum non-authentifiée (users, AS-REP + Kerberoast via Guest, crack auto)
+python adhunt.py 10.10.10.10 -d corp.local
 
-# Scan COMPLET des 65535 ports (ne rate aucun service : web, ftp, custom…)
-python adhunt.py 10.10.10.10 --full
+# Énum AUTHENTIFIÉE complète (LDAP, roast, GPP/LAPS/gMSA, fouille des shares, crack)
+python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!'
 
-# Cible unique + énumération anonyme (AS-REP + Kerberoast via Guest)
-python adhunt.py 10.10.10.10 -d corp.local --anon
+# Pass-the-hash
+python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <nthash>
 
-# Pipeline complet authentifié (mot de passe)
-python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!' --all --loop
+# + ESCALADE offensive (DCSync/ADCS/RBCD/DACL/disk) + boucle jusqu'au DA
+python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!' --exploit --loop
 
-# Full-auto CTF : exploite tout, boucle jusqu'au DA
-python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!' \
-    --all --loop --yes --wordlist /usr/share/wordlists/rockyou.txt
-
-# Pass-the-hash, lecture seule (rapport client sans action offensive)
-python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
+# Voir tout le détail à l'écran (sinon dans loot/<domaine>/debug.log)
+python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!' --verbose
 ```
 
 ---
@@ -193,19 +193,16 @@ python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
 
 | Option | Rôle |
 |---|---|
-| `target` | IP, CIDR, hostname ou fichier de cibles |
+| `target` | **IP du DC** (celle que ton nmap a trouvée), hostname ou fichier de cibles |
 | `-d, --domain` | Domaine AD (auto-détecté sinon) |
 | `-u/-p` · `-H` · `-k` | User+pass · hash NTLM (pass-the-hash) · Kerberos |
-| `-p-, --full` | **Scan COMPLET des 65535 ports** (via nmap si présent) — ne rate aucun port |
-| `--ports` | Ports custom (ex: `80,443,8080`) au lieu du set par défaut (42 ports AD + courants) |
-| `--anon` | Énumération non-authentifiée (Phase 1) |
-| `--spray` | Password spraying (Phase 2) |
-| `--all` | Toutes les phases applicables |
-| `--loop` | Re-enum auth à chaque nouveau cred (jusqu'au DA) |
-| `--safe` | **Lecture seule** : aucune action offensive |
-| `--yes` | Confirme les actions actives (DCSync, RBCD, relais, ADCS req, RCE) |
-| `--relay` | Coercition + ntlmrelayx (avec `--yes` + `--lhost`) |
-| `--userlist` | Userlist pour seeder la phase 1 (ex: `wordlists/userlist.txt`) |
+| `--exploit` | **Active l'escalade offensive** (DCSync, ADCS/ESC, RBCD/shadow, DACL, disk hunt). Sans ce flag : énum + roast + crack + affichage seulement |
+| `--loop` | Re-enum auth à chaque nouveau cred (jusqu'au DA) — utile avec `--exploit` |
+| `--spray` | Password spraying (opt-in, lockout-aware) |
+| `--verbose` | Réaffiche à l'écran la progression + les erreurs (sinon dans `debug.log`) |
+| `--safe` | **Lecture seule** : aucune action offensive même avec `--exploit` |
+| `--relay` | Coercition + ntlmrelayx (avec `--exploit` + `--lhost`) |
+| `--userlist` | Userlist pour seeder l'énum (ex: `wordlists/userlist.txt`) |
 | `--wordlist` | Wordlist pour le crack auto (rockyou par défaut si présent) |
 | `--passwordlist` | Wordlist pour le spray (défaut : liste intégrée adaptée au domaine) |
 | `-o, --loot` | Dossier de sortie (défaut `loot/`) |
@@ -218,6 +215,7 @@ python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
 loot/<domaine>/
 ├── report.md            # rapport priorisé (à lire en premier)
 ├── report.json          # état complet (machine-readable)
+├── debug.log            # progression + erreurs (tout le détail que l'écran cache)
 ├── audit.log            # journal horodaté de toutes les actions
 ├── users.txt            # utilisateurs énumérés
 ├── valid_creds.txt      # creds trouvées (spray/crack)
@@ -245,8 +243,8 @@ loot/<domaine>/
 
 ## Statut & limites
 
-- **Phase 0** (scan + sonde SMB2) : validée en conditions réelles.
-- **Phases 1→5** : la logique d'orchestration compile et se déroule de bout en bout ; les briques de parsing sont testées en isolé. **Les attaques réelles doivent être validées contre un DC** (lab **GOAD** ou box HTB AD).
+- **Recon** (confirmation services + sonde SMB2) et **tableau de bord vivant** : validés (rendu, filtre d'erreurs, redraw testés).
+- **Énum → crack → escalade** : la logique compile et se déroule de bout en bout ; les briques de parsing sont testées en isolé. **Les attaques réelles doivent être validées contre un DC** (lab **GOAD** ou box HTB/THM AD).
 - Les formats de sortie de certains outils (surtout netexec) varient selon les versions — la version de nxc est loggée pour diagnostiquer rapidement un parsing qui ne matche pas.
 
 Contributions / retours de lab bienvenus.

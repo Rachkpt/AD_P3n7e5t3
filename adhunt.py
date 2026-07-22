@@ -1327,7 +1327,7 @@ def ldap_acl_scan(conn, base, state):
                         add_finding(state, "CRIT",
                                     f"{pn} -> {'/'.join(dgr[1])} sur le DOMAINE (=> DCSync possible)",
                                     f"dacledit.py -action write -rights DCSync -principal {pn} "
-                                    f"-target-dn '{base}' {state.get('domain')}/{pn}:<pass>", dc)
+                                    f"-target-dn '{base}' {state.get('domain')}/{pn}:<pass>")
                 for psid, rights in repl.items():
                     if "GetChangesAll" in rights:
                         pname = sid_map.get(psid, psid)
@@ -1609,13 +1609,15 @@ def _pot_paths():
 
 def _john_pot_lines(valid_users):
     """Lit john.pot (hash_complet:password) et garde les lignes de NOS users.
-    (john --show affiche '?:pw' pour les hashes Kerberos -> le pot a le vrai user)."""
+    Comparaison INSENSIBLE A LA CASSE (le pot peut avoir 'cody_roy' et les users
+    'CODY_ROY' selon l'outil qui a genere le hash -> sinon on rate le cred)."""
     out = []
+    valid_lower = {v.lower() for v in valid_users} if valid_users else None
     for pot in _pot_paths():
         try:
             for pl in open(pot, encoding="utf-8", errors="ignore"):
                 u = _extract_cracked_user(pl)
-                if u and (not valid_users or u in valid_users):
+                if u and (valid_lower is None or u.lower() in valid_lower):
                     out.append(pl.strip())
         except Exception:
             pass

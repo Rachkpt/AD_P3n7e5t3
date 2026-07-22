@@ -70,21 +70,22 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 ## Les 6 phases en détail
 
 ### Phase 0 — Découverte (réseau, sans creds)
-- Scan des ports AD (445 SMB, 389/636 LDAP, 88 Kerberos, 135 RPC, 53 DNS, 5985 WinRM, 1433 MSSQL, 3268 GC, 9389 ADWS…)
+- **Scan de 42 ports par défaut** (AD + services courants : web, ftp, rpc-http…) ; **`-p-`/`--full`** = 65535 ports via nmap → **ne rate aucun port ouvert** ; **table** PORT/SERVICE/VERSION (nmap -sV)
 - **Détection automatique des Domain Controllers**
 - **Sonde SMB2 pur-python** (zéro dépendance) : `signing requis ?` (→ surface de relais NTLM), dialecte, **clock skew Kerberos**
 - rootDSE LDAP anonyme (domaine, forêt, naming contexts) + null session (OS, hostname)
 
 ### Phase 1 — Énumération non-authentifiée
 - **Password policy** (récupérée AVANT tout spray → seuil de lockout)
-- Null session SMB (shares/users/groups), **RID cycling**, LDAP anonyme
-- **kerbrute** (énumération d'utilisateurs sans lockout), fallback **rpcclient**
-- **AS-REP roasting** (comptes sans pré-auth → hash crackable sans creds)
+- Null session SMB (shares/users/groups), **RID cycling**, LDAP anonyme, **table des users confirmés**
+- **kerbrute** (énumération d'utilisateurs sans lockout, seed via `--userlist`), fallback **rpcclient**
+- **AS-REP roasting** + **Kerberoast via Guest** (foothold sans creds valides) → **auto-crack** (hashcat→John si pas de GPU)
 - Surface notée : **relais NTLM** (signing off), **LLMNR/NBT-NS poisoning** (Responder), coercition
 
 ### Phase 2 — Attaque de mot de passe
 - **Password spraying lockout-aware** : bride le nombre d'essais sous le seuil, throttle
-- Wordlist auto (saison+année, nom de société, mots de passe communs)
+- Wordlist auto (saison+année, **nom de société dérivé du domaine**, mots de passe communs) ou `--passwordlist`
+- **Réutilisation de mot de passe** : rejoue les mdp crackés sur tous les users
 - Les creds valides → réinjectés en Phase 3
 
 ### Phase 3 — Énumération authentifiée (le cœur)
@@ -92,24 +93,26 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
   - Kerberoastable (SPN), AS-REP roastable, adminCount, flags UAC, délégations, **mots de passe dans les descriptions**
 - **Scan ACL/DACL** (mini-BloodHound autonome) : GenericAll / WriteDACL / WriteOwner / ForceChangePassword / DCSync / AddMember — filtre les comptes privilégiés
 - **Kerberoasting** + AS-REP (vue authentifiée)
-- **GPP cpassword** (SYSVOL), **LAPS** (ms-Mcs-AdmPwd lisible), **gMSA** (msDS-ManagedPassword → hash NT)
+- **GPP cpassword** (SYSVOL + `Get-GPPPassword.py`), **LAPS** (ms-Mcs-AdmPwd + `GetLAPSPassword.py`), **gMSA** (msDS-ManagedPassword → hash NT)
 - **ADCS** (certipy `-json`) : templates vulnérables ESC1→ESC16
-- **Délégations** (unconstrained / constrained / RBCD), **trusts** (SID-history child→parent)
+- **BadSuccessor** (2025) : détection dMSA (msDS-DelegatedManagedServiceAccount) → héritage de privilèges
+- **Délégations** (unconstrained / constrained / RBCD), **trusts** (raiseChild / goldenPac child→parent, SID-history)
 - **MSSQL** (sysadmin → xp_cmdshell, links cross-forest, vol NetNTLM)
-- **Shares** : énumération authentifiée **+ spidering** des fichiers sensibles (`.config`, `.ps1`, `unattend.xml`, `.kdbx`…)
+- **Shares** : énum authentifiée **+ LOOT réel** (télécharge les fichiers sensibles, **décode le base64**, extrait les creds → réinjectées dans la boucle)
 - **BloodHound** (collecte + analyse du zip : DCSync, délégation non contrainte, high-value)
-- **Auto-crack** (hashcat/john) des hashes AS-REP/Kerberoast → creds réinjectés
+- **Auto-crack** (hashcat → **fallback John si pas de GPU**) des hashes AS-REP/Kerberoast → creds réinjectés
 
 ### Phase 4 — Escalade & latéral (exploitation active, `--yes`)
-- **Exploitation des ACL** : `GenericAll` sur un user → **Shadow Credentials** + **Targeted Kerberoast** ; `GenericWrite` sur une machine → **RBCD**
+- **Exploitation des ACL** : `GenericAll` sur un user → **Shadow Credentials** + **Targeted Kerberoast** ; `GenericWrite` sur une machine → **RBCD** ; `WriteDACL` sur le domaine → **dacledit** (auto-DCSync)
 - **PKINIT** : `certipy req` (ESC1) → `certipy auth` → hash NT
 - **Cartographie** des creds sur tous les hôtes (admin local ?) → **RCE** (wmiexec) + commande shell (evil-winrm)
 - **DCSync** (`secretsdump -just-dc`) → NTDS → **extraction krbtgt → Golden Ticket**
 - **Coercition + relais NTLM** (PetitPotam/Coercer → ntlmrelayx) avec `--relay`
 
 ### Phase 5 — Rapport
-- `report.md` priorisé par sévérité (CRIT/HIGH/MED/INFO), comptes remarquables, creds, hashes à cracker, commandes prêtes
+- `report.md` **priorisé par sévérité** (CRIT/HIGH/MED/INFO), comptes remarquables, creds, hashes à cracker, commandes prêtes — **findings dédupliqués**
 - `report.json` (état complet) + `loot/` (hashes, tickets, fichiers) + `audit.log` horodaté
+- **`[>] PROCHAINE COMMANDE`** : suggère la commande à lancer ensuite selon l'état (nouveau cred → `--all`, NTDS → evil-winrm…)
 
 ---
 
@@ -167,7 +170,10 @@ python adhunt.py <IP> -d <domaine> --anon --userlist wordlists/userlist.txt
 # Découverte d'un subnet (repère les DC, signing, clock skew)
 python adhunt.py 10.10.10.0/24
 
-# Cible unique + énumération anonyme
+# Scan COMPLET des 65535 ports (ne rate aucun service : web, ftp, custom…)
+python adhunt.py 10.10.10.10 --full
+
+# Cible unique + énumération anonyme (AS-REP + Kerberoast via Guest)
 python adhunt.py 10.10.10.10 -d corp.local --anon
 
 # Pipeline complet authentifié (mot de passe)
@@ -190,6 +196,8 @@ python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
 | `target` | IP, CIDR, hostname ou fichier de cibles |
 | `-d, --domain` | Domaine AD (auto-détecté sinon) |
 | `-u/-p` · `-H` · `-k` | User+pass · hash NTLM (pass-the-hash) · Kerberos |
+| `-p-, --full` | **Scan COMPLET des 65535 ports** (via nmap si présent) — ne rate aucun port |
+| `--ports` | Ports custom (ex: `80,443,8080`) au lieu du set par défaut (42 ports AD + courants) |
 | `--anon` | Énumération non-authentifiée (Phase 1) |
 | `--spray` | Password spraying (Phase 2) |
 | `--all` | Toutes les phases applicables |
@@ -197,7 +205,9 @@ python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <lm:nt> --all --safe
 | `--safe` | **Lecture seule** : aucune action offensive |
 | `--yes` | Confirme les actions actives (DCSync, RBCD, relais, ADCS req, RCE) |
 | `--relay` | Coercition + ntlmrelayx (avec `--yes` + `--lhost`) |
+| `--userlist` | Userlist pour seeder la phase 1 (ex: `wordlists/userlist.txt`) |
 | `--wordlist` | Wordlist pour le crack auto (rockyou par défaut si présent) |
+| `--passwordlist` | Wordlist pour le spray (défaut : liste intégrée adaptée au domaine) |
 | `-o, --loot` | Dossier de sortie (défaut `loot/`) |
 
 ---

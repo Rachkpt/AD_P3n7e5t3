@@ -460,11 +460,13 @@ def phase0_discovery(targets, args):
 import subprocess
 
 def run_cmd(cmd, timeout=300, feed=None):
-    """Lance une commande externe, renvoie (rc, stdout, stderr)."""
+    """Lance une commande externe, renvoie (rc, stdout, stderr).
+    IMPORTANT : stdin est toujours fourni (jamais None) -> aucune commande ne peut
+    BLOQUER sur une saisie interactive (ex: 'Password:'). EOF/vide -> elle continue."""
     audit("CMD " + " ".join(str(c) for c in cmd))
     try:
         pr = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                            input=feed, errors="ignore")
+                            input=(feed if feed is not None else ""), errors="ignore")
         return pr.returncode, pr.stdout or "", pr.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"

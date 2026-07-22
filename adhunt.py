@@ -1661,7 +1661,10 @@ def crack_hashes(args, state):
             continue
         mode = modes.get(kind, None)
         fmt = "krb5asrep" if kind == "asrep" else "krb5tgs"
-        valid = _hashfile_users(path)   # users presents dans CE fichier de hashes
+        # users du fichier courant + TOUS les users confirmes du domaine : ainsi un
+        # cred deja craque (present dans john.pot) est recupere meme si le fichier de
+        # hash de CE run ne le contient pas (ex: guest kerberoast renvoie d'autres SPN)
+        valid = _hashfile_users(path) | set(state.get("users") or [])
         creds = {}                      # user -> pw (dedupe naturel)
         # 1) hashcat (si device) : --show filtre aux vraies lignes de hash
         if have("hashcat") and mode:

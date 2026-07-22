@@ -461,12 +461,14 @@ import subprocess
 
 def run_cmd(cmd, timeout=300, feed=None):
     """Lance une commande externe, renvoie (rc, stdout, stderr).
-    IMPORTANT : stdin est toujours fourni (jamais None) -> aucune commande ne peut
-    BLOQUER sur une saisie interactive (ex: 'Password:'). EOF/vide -> elle continue."""
+    IMPORTANT : stdin fourni (jamais None) + NOUVELLE SESSION sans terminal
+    (start_new_session) -> getpass ne peut plus ouvrir /dev/tty -> AUCUN prompt
+    'Password:' ne peut bloquer l'outil (ex: GetUserSPNs/secretsdump/certipy)."""
     audit("CMD " + " ".join(str(c) for c in cmd))
     try:
         pr = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                            input=(feed if feed is not None else ""), errors="ignore")
+                            input=(feed if feed is not None else ""), errors="ignore",
+                            start_new_session=True)
         return pr.returncode, pr.stdout or "", pr.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"

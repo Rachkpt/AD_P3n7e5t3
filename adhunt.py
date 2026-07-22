@@ -809,6 +809,13 @@ def phase2_password(hosts, args, state):
     dc = first_dc(hosts)
     nxc = nxc_bin()
     users = state.get("users") or []
+    # si on a DEJA un cred (crack/loot), le spray de mdp communs est inutile + lent
+    # (491 users x N mdp) -> on file direct a l'enum auth ; le VRAI spray (reutilisation
+    # du mdp craque) tourne en phase 3. Sauf si --passwordlist est explicitement demande.
+    if state.get("creds") and not getattr(args, "passwordlist", None):
+        log(f"{C.GR}[i] {len(state['creds'])} cred(s) deja obtenue(s) -> spray par defaut saute "
+            f"(le reuse-spray tournera en phase 3).{C.X}")
+        return
     if not users:
         log(f"{C.Y}[i] Pas de userlist (phase 1) -> spray saute.{C.X}")
         return
@@ -822,11 +829,13 @@ def phase2_password(hosts, args, state):
             passwords = [l.strip() for l in f if l.strip() and not l.startswith("#")]
     else:
         passwords = default_passwords(args)
-    # un SPRAY teste PEU de mdp (sinon = brute + lockout). Cap selon la policy.
+    # un SPRAY teste PEU de mdp (sinon = brute + lockout). Cap selon la policy + nb users.
     if thr and thr > 0:
         cap = max(1, thr - 2)
+    elif len(users) > 200:
+        cap = 5    # beaucoup d'users -> peu de mdp (spray = largeur, pas profondeur)
     else:
-        cap = 12   # lockout inconnu -> on reste sur les mdp les plus probables
+        cap = 12
     if len(passwords) > cap:
         log(f"{C.Y}[!] Spray limite a {cap} mdp (lockout={thr}) -> "
             f"--passwordlist pour forcer plus, mais attention au lockout.{C.X}")

@@ -1656,17 +1656,15 @@ def crack_hashes(args, state):
         return 0
     new = 0
     modes = {"asrep": "18200", "kerberoast": "13100"}
+    domain_users = set(state.get("users") or [])
     for kind, path in hashes.items():
         if not os.path.isfile(path):
             continue
         mode = modes.get(kind, None)
         fmt = "krb5asrep" if kind == "asrep" else "krb5tgs"
-        # users du fichier courant + TOUS les users confirmes du domaine : ainsi un
-        # cred deja craque (present dans john.pot) est recupere meme si le fichier de
-        # hash de CE run ne le contient pas (ex: guest kerberoast renvoie d'autres SPN)
-        valid = _hashfile_users(path) | set(state.get("users") or [])
         creds = {}                      # user -> pw (dedupe naturel)
-        # 1) hashcat (si device) : --show filtre aux vraies lignes de hash
+
+        # (a) hashcat sur le fichier BRUT (cas GPU) -> --show : lignes '$krb5...:pw'
         if have("hashcat") and mode:
             log(f"{C.GR}[i] Crack {kind} (hashcat -m {mode}) avec {os.path.basename(wl)}...{C.X}")
             run_cmd(["hashcat", "-m", mode, path, wl, "--quiet", "--force"], args.crack_timeout)
@@ -1676,24 +1674,48 @@ def crack_hashes(args, state):
                     u, pw = _extract_cracked_user(l), l.rsplit(":", 1)[-1].strip()
                     if u and pw:
                         creds[u] = pw
-        # 2) John (CPU) si hashcat n'a rien craque
-        if not creds and have("john"):
-            log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
-            run_cmd(["john", f"--format={fmt}", f"--wordlist={wl}", path], args.crack_timeout)
-        # 3) john.pot (fiable : hash complet -> vrai user) + 4) john --show (paire ?:pw)
-        for l in _john_pot_lines(valid):
+
+        # (b) JOHN : on prefixe chaque hash par 'user:' -> John connait le login
+        #     -> 'john --show' renvoie 'user:password' (fini le '?:pw' non attribuable)
+        if have("john"):
+            jf = path + ".john"
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as s, \
+                     open(jf, "w", encoding="utf-8") as d:
+                    for line in s:
+                        line = line.strip()
+                        if line and "$krb5" in line:
+                            d.write(f"{_extract_cracked_user(line) or 'usr'}:{line}\n")
+                if not creds:
+                    log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
+                    run_cmd(["john", f"--format={fmt}", f"--wordlist={wl}", jf], args.crack_timeout)
+                rc, out, _ = run_cmd(["john", "--show", f"--format={fmt}", jf], 120)
+                for l in out.splitlines():
+                    l = l.strip()
+                    if ":" not in l or re.search(r"password hash|cracked|Loaded|No password", l, re.I):
+                        continue
+                    rest = l.split(":")
+                    u = rest[0].strip()
+                    # john --show = 'user:password[:uid:gid:...]' (ou hash intercale)
+                    # -> le mdp = 1er champ non vide et non-hash apres le user
+                    cand = [f.strip() for f in rest[1:] if f.strip() and not f.strip().startswith("$")]
+                    pw = cand[0] if cand else ""
+                    if u and not u.startswith("$") and pw and "$krb5" not in pw:
+                        creds[u] = pw
+            except Exception:
+                pass
+
+        # (c) filet de securite : john.pot (users du domaine) -> hash complet -> user fiable
+        for l in _john_pot_lines(domain_users):
             u, pw = _extract_cracked_user(l), l.rsplit(":", 1)[-1].strip()
             if u and pw:
-                creds[u] = pw
-        if not creds:
-            for u, pw in _john_show_pairs(fmt, path, valid):
-                creds[u] = pw
-        # diagnostic : combien de creds + ou est le pot
+                creds.setdefault(u, pw)
+
         pots = _pot_paths()
         log(f"{C.GR}    (crack {kind}: {len(creds)} cred(s) | pot: "
             f"{pots[0] if pots else 'INTROUVABLE'}){C.X}")
         for user, pw in creds.items():
-            if 0 < len(pw) < 60 and "$krb5" not in pw:
+            if 0 < len(pw) < 60 and "$krb5" not in pw and user != "usr":
                 if not any(c.get("user") == user and c.get("password") == pw
                            for c in state.get("creds", [])):
                     state.setdefault("creds", []).append(

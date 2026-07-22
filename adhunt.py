@@ -1099,9 +1099,11 @@ def enum_laps_impacket(args, state, dc):
         return
     tgt, extra = impacket_creds(args)
     rc, out, _ = run_cmd(["GetLAPSPassword.py", tgt, "-dc-ip", dc] + extra, 180)
-    for m in re.finditer(r"([A-Za-z0-9._-]+\$?)\s+.*?\s([^\s]{8,})\s*$", out, re.M):
+    # ligne LAPS = NOM_MACHINE$ suivi d'un mot de passe fort (evite le blabla de l'outil)
+    for m in re.finditer(r"^\s*([A-Za-z0-9-]+\$)\s+(\S{10,})\s*$", out, re.M):
         host, pw = m.group(1), m.group(2)
-        if pw and pw not in ("Password", "LAPS"):
+        # un vrai mdp LAPS = melange maj/min/chiffre (pas un mot du texte de sortie)
+        if re.search(r"[A-Z]", pw) and re.search(r"[a-z]", pw) and re.search(r"\d", pw):
             add_finding(state, "CRIT", f"LAPS (impacket) : {host} -> {pw[:45]}",
                         "mot de passe admin local en clair")
 
@@ -1189,6 +1191,11 @@ REPL_GUIDS = {
     "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "GetChanges",
     "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "GetChangesAll",
 }
+# WRITE_PROP sur un attribut PRECIS -> abus cible (comme BloodHound)
+WRITE_ATTR_DANGEROUS = {
+    "f3a64788-5306-11d1-a9c5-0000f80367c1": "Write-SPN",              # servicePrincipalName -> targeted kerberoast
+    "5b47d60f-6090-40b2-9f37-2a4de88f3063": "Write-KeyCredentialLink",# msDS-KeyCredentialLink -> shadow creds
+}
 # RIDs de comptes/groupes privilegies -> on ignore (ils ont des droits partout, bruit)
 PRIV_RIDS = {"500", "502", "512", "516", "518", "519", "521", "544", "548",
              "549", "550", "551", "553"}
@@ -1238,8 +1245,16 @@ def _dangerous_ace(ace, allow_inherited=False):
     if mask & WRITE_DACL:   rights.append("WriteDACL")
     if mask & WRITE_OWNER:  rights.append("WriteOwner")
     guid = _ace_guid(a)
-    # extended rights EXPLOITABLES (la replication est traitee a part -> DCSync)
-    if guid and guid in EXT_RIGHTS and guid not in REPL_GUIDS and (mask & CTRL_ACCESS or mask & WRITE_PROP):
+    # WRITE_PROP : sur TOUTES les proprietes (pas de GUID) = GenericWrite (cle !)
+    #              sur un attribut precis (SPN / KeyCredentialLink) = abus cible
+    if mask & WRITE_PROP:
+        if not guid:
+            if "GenericWrite" not in rights:
+                rights.append("GenericWrite")
+        elif guid in WRITE_ATTR_DANGEROUS:
+            rights.append(WRITE_ATTR_DANGEROUS[guid])
+    # extended rights EXPLOITABLES (control access ; replication traitee a part)
+    if guid and guid in EXT_RIGHTS and guid not in REPL_GUIDS and (mask & CTRL_ACCESS):
         rights.append(EXT_RIGHTS[guid])
     return (sid, rights) if rights else None
 
@@ -1962,7 +1977,8 @@ def abuse_acl_paths(args, state, dc):
             continue
         done.add((frm, to))
         strong = any(r in rights for r in ("GenericAll", "GenericWrite", "WriteDACL",
-                                           "WriteOwner", "AllExtendedRights"))
+                                           "WriteOwner", "AllExtendedRights",
+                                           "Write-SPN", "Write-KeyCredentialLink"))
         if frm.lower() != me:   # on n'exploite que ce qu'on controle
             add_finding(state, "HIGH", f"Chemin ACL : {frm} -> {'/'.join(rights)} sur {to}",
                         f"prends le controle de {frm} pour l'exploiter")

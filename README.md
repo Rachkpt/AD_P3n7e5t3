@@ -106,10 +106,19 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 
 ### Phase 4 — Escalade & latéral (**seulement avec `--exploit`**)
 - **Exploitation des ACL** : `GenericAll` sur un user → **Shadow Credentials** + **Targeted Kerberoast** ; `GenericWrite` sur une machine → **RBCD** ; `WriteDACL` sur le domaine → **dacledit** (auto-DCSync)
+- **Délégation contrainte** (`msDS-AllowedToDelegateTo`) → **S4U2Self+S4U2Proxy** (`getST -impersonate Administrator`) si le compte délégant est possédé
 - **PKINIT** : `certipy req` (ESC1) → `certipy auth` → hash NT
 - **Cartographie** des creds sur tous les hôtes (admin local ?) → **RCE** (wmiexec) + commande shell (evil-winrm)
 - **DCSync** (`secretsdump -just-dc`) → NTDS → **extraction krbtgt → Golden Ticket**
 - **Coercition + relais NTLM** (PetitPotam/Coercer → ntlmrelayx) avec `--relay`
+
+### Modules "hard box" (détection + commande prête, cheat sheet)
+Suivant la règle *« je propose, je n'exécute pas les trucs à fort impact sans confirmation »* :
+- **CVE checks** (via modules nxc) — **détection seule, jamais d'auto-exploit** : **ZeroLogon** (non-auth, check only), **NoPac** (CVE-2021-42278/42287), **PrintNightmare**, **PetitPotam**
+- **Silver Ticket** : si hash NT d'un compte de service (ou mdp→NT via **MD4 pur-python**) + SID du domaine → commande `ticketer` prête
+- **GPO abuse** : GPO modifiable détectée (ACE dangereuse sur `groupPolicyContainer`) → commande `SharpGPOAbuse`
+- **Local-auth hash spray** : rejoue un hash admin **local** (LAPS/SAM) sur les hôtes (`nxc --local-auth`)
+- **Poisoning sans cred** (proposés dès le début) : **Responder** (LLMNR/NBT-NS) + **mitm6** (relais LDAPS) — jamais exécutés
 
 ### Phase 5 — Rapport
 - `report.md` **priorisé par sévérité** (CRIT/HIGH/MED/INFO), comptes remarquables, creds, hashes à cracker, commandes prêtes — **findings dédupliqués**

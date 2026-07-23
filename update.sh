@@ -11,13 +11,13 @@ cd "$HERE"
 echo -e "${G}[*] Mise a jour d'adhunt...${X}"
 
 # 1) recupere la derniere version (fast-forward only = pas de merge surprise)
-if git pull --ff-only 2>/tmp/adhunt_pull.err; then
+if PULL_OUT="$(git pull --ff-only 2>&1)"; then
   echo -e "${G}[+] Code a jour.${X}"
 else
-  echo -e "${Y}[!] git pull bloque (souvent des modifs locales dans le depot).${X}"
-  echo -e "${GR}    -> mets tes modifs de cote puis reessaie :${X}"
-  echo -e "${GR}       git stash && ./update.sh   (git stash pop pour les recuperer apres)${X}"
-  cat /tmp/adhunt_pull.err 2>/dev/null | sed 's/^/    /'
+  echo -e "${Y}[!] git pull bloque :${X}"
+  echo "$PULL_OUT" | sed 's/^/    /'
+  echo -e "${GR}    Modifs locales ? Force la version du depot (tu perds tes modifs locales) :${X}"
+  echo -e "${GR}       git fetch origin && git reset --hard origin/main && ./update.sh${X}"
   exit 1
 fi
 

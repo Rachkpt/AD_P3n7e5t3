@@ -13,11 +13,12 @@ echo -e "${G}[*] Installation d'adhunt...${X}"
 [ -f "$SRC" ] || { echo -e "${R}[!] adhunt.py introuvable a cote de install.sh${X}"; exit 1; }
 
 # 1) fin de lignes LF (au cas ou le fichier arrive en CRLF depuis Windows)
-if head -1 "$SRC" | grep -q $'\r'; then
+if head -1 "$SRC" | grep -q $'\r' 2>/dev/null; then
   echo -e "${GR}[i] Conversion CRLF -> LF (shebang)...${X}"
-  sed -i 's/\r$//' "$SRC"
+  sed -i 's/\r$//' "$SRC" 2>/dev/null || true
 fi
-chmod +x "$SRC"
+# +x si on est proprietaire ; sinon pas grave (le wrapper lance via python3)
+chmod +x "$SRC" 2>/dev/null || true
 
 # 2) dependances python (optionnelles mais recommandees : dump LDAP + PtH)
 if command -v pip3 >/dev/null 2>&1; then
@@ -37,9 +38,17 @@ else
   BIN="$HOME/.local/bin"; mkdir -p "$BIN"
 fi
 
-# 4) symlink -> 'git pull' met a jour la commande automatiquement
-$SUDO ln -sf "$SRC" "$BIN/adhunt"
-echo -e "${G}[+] Installe : ${BIN}/adhunt  ->  ${SRC}${X}"
+# 4) lanceur (wrapper) -> lance 'python3 adhunt.py' : robuste peu importe le
+#    proprietaire / le bit +x du fichier. 'git pull' met a jour automatiquement.
+WRAP="$(mktemp)"
+cat > "$WRAP" <<EOF
+#!/usr/bin/env bash
+# lanceur adhunt (genere par install.sh) -> pointe vers le depot
+exec python3 "$SRC" "\$@"
+EOF
+$SUDO install -m 0755 "$WRAP" "$BIN/adhunt"
+rm -f "$WRAP"
+echo -e "${G}[+] Installe : ${BIN}/adhunt  ->  python3 ${SRC}${X}"
 
 # 5) verifie que BIN est bien dans le PATH
 case ":$PATH:" in

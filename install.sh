@@ -50,4 +50,5 @@ esac
 
 echo -e "${G}[+] Termine !${X} Lance simplement :"
 echo -e "    ${G}adhunt <IP_du_DC> -d <domaine> -u <user> -p <pass>${X}"
-echo -e "${GR}    (desinstaller : ${SUDO} rm \$(command -v adhunt))${X}"
+echo -e "${GR}    Mise a jour  : cd $HERE && git pull   (symlink -> instantane, rien a refaire)${X}"
+echo -e "${GR}    Desinstaller : ${SUDO} rm \$(command -v adhunt)${X}"

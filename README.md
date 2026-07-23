@@ -169,7 +169,12 @@ adhunt <IP_du_DC> -d <domaine> -u <user> -p <pass>
 ```
 
 > Le symlink pointe vers le dépôt : un simple `git pull` **met la commande à jour** automatiquement.
-> Désinstaller : `sudo rm $(command -v adhunt)`.
+
+**Mettre à jour** (code + dépendances + lien, en une commande) :
+```bash
+cd AD_P3n7e5t3 && ./update.sh
+```
+`update.sh` fait `git pull` puis relance l'installeur (idempotent). Si un jour une nouvelle version ajoute une dépendance, elle est installée toute seule. Désinstaller : `sudo rm $(command -v adhunt)`.
 
 ### Sans installer (lancement direct)
 

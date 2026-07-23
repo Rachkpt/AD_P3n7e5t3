@@ -153,24 +153,38 @@ adhunt **n'est pas** une réimplémentation : il **orchestre** les références 
 
 ## Installation
 
+### Installation rapide (Kali / Debian / Ubuntu) — commande globale `adhunt`
+
 ```bash
 git clone https://github.com/Rachkpt/AD_P3n7e5t3.git
 cd AD_P3n7e5t3
-
-# Fallbacks LDAP / pass-the-hash (recommandé, débloque le dump LDAP + ACL) :
-pip install ldap3 impacket
-
-# Outils externes : déjà présents sur Kali / Exegol. Sinon :
-#   netexec (nxc), impacket, certipy-ad, kerbrute, bloodhound-python, hashcat
+chmod +x install.sh
+./install.sh
 ```
 
-Python 3.8+. Fonctionne sous Linux (recommandé) et Windows. **La puissance maximale s'obtient sur Kali/Exegol** où tous les outils externes sont là.
+L'installeur : convertit les fins de ligne si besoin, installe `ldap3`/`impacket` (gère aussi les systèmes « externally-managed » via `--break-system-packages`), et crée un **symlink** `adhunt` dans ton PATH (`/usr/local/bin` ou `~/.local/bin`). Ensuite, **depuis n'importe où** :
+
+```bash
+adhunt <IP_du_DC> -d <domaine> -u <user> -p <pass>
+```
+
+> Le symlink pointe vers le dépôt : un simple `git pull` **met la commande à jour** automatiquement.
+> Désinstaller : `sudo rm $(command -v adhunt)`.
+
+### Sans installer (lancement direct)
+
+```bash
+pip install ldap3 impacket          # fallbacks LDAP / pass-the-hash (recommandé)
+python3 adhunt.py <IP_du_DC> -d <domaine> -u <user> -p <pass>
+```
+
+Outils externes (déjà là sur Kali / Exegol) : `netexec` (nxc), impacket, `certipy-ad`, `kerbrute`, `bloodhound-python`, `hashcat`. Python 3.8+. **La puissance maximale s'obtient sur Kali/Exegol.**
 
 ### Wordlists incluses
 Le dossier **`wordlists/`** contient `userlist.txt` + `passwordlist.txt` (utiles pour kerbrute / spray, ex. THM *Attacktive Directory*) :
 ```bash
-# quand le null/RID est bloqué, on seed la phase 1 avec une userlist :
-python adhunt.py <IP> -d <domaine> --anon --userlist wordlists/userlist.txt
+# quand le null/RID est bloqué, on seed l'énum avec une userlist :
+adhunt <IP_du_DC> -d <domaine> --userlist wordlists/userlist.txt
 ```
 
 ---

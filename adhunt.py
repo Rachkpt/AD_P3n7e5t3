@@ -11,6 +11,7 @@ Il pilote les vrais outils (netexec/nxc, impacket, ldap3, kerbrute, certipy,
 bloodhound-python, hashcat/john) quand ils sont presents, fallback pur-python.
 
   RECON      : confirme les services AD (LDAP/SMB/Kerberos/DNS) + rootDSE (PAS de scan)
+  RECON DNS  : [V2] SRV _ldap._tcp.dc._msdcs (decouvre les DC), SOA, transfert AXFR
   ENUM NON-AUTH : password policy, null/RID cycling, kerbrute, AS-REP + Kerberoast guest
   ENUM AUTH  : dump LDAP (kerberoastable/asrep/UAC/deleg/descriptions), Kerberoast,
                GPP cpassword, LAPS, gMSA, BloodHound, FOUILLE des shares
@@ -711,6 +712,158 @@ def uac_flags(v):
     return [name for bit, name in UAC.items() if v & bit]
 
 # ======================================================================
+# RECON DNS (etape 1 du module HTB) : SRV _ldap._tcp.dc._msdcs (decouvre les
+# DC), ANY/SOA, et surtout TRANSFERT DE ZONE (AXFR) qui dump tout le domaine.
+# Pilote dig/nslookup si presents, sinon parseur DNS pur-python (UDP + AXFR TCP).
+# ======================================================================
+_DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
+              16: "TXT", 28: "AAAA", 33: "SRV"}
+_DNS_T = {v: k for k, v in _DNS_TYPES.items()}
+
+def _dns_qname(name):
+    out = b""
+    for lbl in name.rstrip(".").split("."):
+        out += bytes([len(lbl)]) + lbl.encode()
+    return out + b"\x00"
+
+def _dns_read_name(buf, off):
+    """Lit un nom DNS a partir de off, en suivant la compression (pointeurs)."""
+    labels = []; jumped = False; start = off; safety = 0
+    while safety < 128:
+        safety += 1
+        if off >= len(buf):
+            break
+        ln = buf[off]
+        if ln == 0:
+            off += 1; break
+        if ln & 0xC0 == 0xC0:                       # pointeur de compression
+            ptr = ((ln & 0x3F) << 8) | buf[off + 1]
+            if not jumped:
+                start = off + 2
+            off = ptr; jumped = True; continue
+        labels.append(buf[off + 1:off + 1 + ln].decode("latin-1")); off += 1 + ln
+    return ".".join(labels), (start if jumped else off)
+
+def _dns_parse_rdata(buf, off, rtype, rdlen):
+    if rtype == _DNS_T["A"] and rdlen == 4:
+        return ".".join(str(b) for b in buf[off:off + 4])
+    if rtype in (_DNS_T["NS"], _DNS_T["CNAME"], _DNS_T["PTR"]):
+        return _dns_read_name(buf, off)[0]
+    if rtype == _DNS_T["SRV"] and rdlen >= 6:
+        prio, weight, port = struct.unpack(">HHH", buf[off:off + 6])
+        tgt = _dns_read_name(buf, off + 6)[0]
+        return f"{tgt}:{port} (prio {prio})"
+    if rtype == _DNS_T["SOA"]:
+        mname, o2 = _dns_read_name(buf, off)
+        rname, _ = _dns_read_name(buf, o2)
+        return f"{mname} {rname}"
+    if rtype == _DNS_T["TXT"] and rdlen:
+        return buf[off + 1:off + rdlen].decode("latin-1", "replace")
+    return buf[off:off + rdlen].hex()
+
+def _dns_parse_records(buf):
+    """Parse une reponse DNS complete -> [(name, type, rdata)]."""
+    if len(buf) < 12:
+        return []
+    qd, an, ns, ar = struct.unpack(">HHHH", buf[4:12])
+    off = 12
+    for _ in range(qd):                              # saute les questions
+        _, off = _dns_read_name(buf, off); off += 4
+    recs = []
+    for _ in range(an + ns + ar):
+        name, off = _dns_read_name(buf, off)
+        if off + 10 > len(buf):
+            break
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+        off += 10
+        recs.append((name, _DNS_TYPES.get(rtype, str(rtype)),
+                     _dns_parse_rdata(buf, off, rtype, rdlen)))
+        off += rdlen
+    return recs
+
+def _dns_query_udp(server, name, qtype, timeout=3):
+    q = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0)
+    q += _dns_qname(name) + struct.pack(">HH", _DNS_T.get(qtype, 255), 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(timeout)
+        s.sendto(q, (server, 53)); data, _ = s.recvfrom(4096); s.close()
+        return _dns_parse_records(data)
+    except Exception as e:
+        dbg(f"[-] DNS {qtype} {name} @ {server}: {e}"); return []
+
+def _dns_axfr(server, domain, timeout=6):
+    """Transfert de zone (AXFR) sur TCP/53. Retourne tous les enregistrements
+    si le DC l'autorise (mauvaise conf classique) -> dump complet du domaine."""
+    q = struct.pack(">HHHHHH", 0xAF11, 0x0000, 1, 0, 0, 0)
+    q += _dns_qname(domain) + struct.pack(">HH", 252, 1)     # 252 = AXFR
+    q = struct.pack(">H", len(q)) + q
+    recs = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
+        s.connect((server, 53)); s.sendall(q)
+        buf = b""
+        while True:
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 2:
+                mlen = struct.unpack(">H", buf[:2])[0]
+                if len(buf) < 2 + mlen:
+                    break
+                recs += _dns_parse_records(buf[2:2 + mlen])
+                buf = buf[2 + mlen:]
+            if len(recs) and buf == b"":
+                break
+        s.close()
+    except Exception as e:
+        dbg(f"[-] AXFR {domain} @ {server}: {e}")
+    return recs
+
+def dns_enum(dc_ip, domain, state, args):
+    """Recon DNS non-authentifie facon HTB : SRV (_ldap/_kerberos/_gc _msdcs)
+    pour reperer les DC, SOA/ANY, et tentative de transfert de zone AXFR."""
+    if not domain:
+        log(f"{C.GR}[i] DNS : domaine inconnu -> recon DNS saute.{C.X}")
+        return
+    stage("RECON DNS (SRV / SOA / transfert de zone)")
+    dc_names, rows = set(), []
+    srvs = [f"_ldap._tcp.dc._msdcs.{domain}", f"_kerberos._tcp.{domain}",
+            f"_gc._tcp.{domain}", f"_ldap._tcp.{domain}"]
+    for q in srvs:
+        for name, rtype, rdata in _dns_query_udp(dc_ip, q, "SRV"):
+            if rtype == "SRV":
+                rows.append([q.split(".")[0], rtype, rdata])
+                host = rdata.split(":")[0].rstrip(".")
+                if host:
+                    dc_names.add(host)
+    for name, rtype, rdata in _dns_query_udp(dc_ip, domain, "SOA"):
+        rows.append([domain, rtype, rdata])
+    if rows:
+        show_table(["requete", "type", "reponse"], rows, C.CY, cap=25)
+    if dc_names:
+        add_finding(state, "INFO", f"DNS SRV : {len(dc_names)} DC/GC repere(s)",
+                    ", ".join(sorted(dc_names)), dc_ip)
+        # resout les DC decouverts -> IP a scanner ensuite
+        for h in sorted(dc_names):
+            for _n, _t, ip in _dns_query_udp(dc_ip, h, "A"):
+                if _t == "A":
+                    log(f"{C.G}[+] DC : {h} -> {ip}{C.X}")
+    # TRANSFERT DE ZONE : la mauvaise conf qui donne tout le domaine
+    axfr = _dns_axfr(dc_ip, domain)
+    real = [r for r in axfr if r[1] not in ("SOA",)] or axfr
+    if len(real) > 1:
+        add_finding(state, "HIGH", "Transfert de zone DNS (AXFR) AUTORISE",
+                    f"dig axfr {domain} @{dc_ip}  -> {len(axfr)} enregistrements dumpes", dc_ip)
+        dump = "\n".join(f"{n}\t{t}\t{d}" for n, t, d in axfr)
+        save_loot(args, "dns_axfr.txt", dump)
+        show_table(["nom", "type", "donnee"], [[n, t, d] for n, t, d in axfr[:30]],
+                   C.G, cap=30)
+        log(f"{C.G}[+] AXFR complet -> loot/.../dns_axfr.txt ({len(axfr)} lignes){C.X}")
+    else:
+        log(f"{C.GR}[i] AXFR refuse par {dc_ip} (comportement normal d'un DC durci).{C.X}")
+
+# ======================================================================
 # PHASE 1 : ENUM NON-AUTHENTIFIEE
 # ======================================================================
 def phase1_unauth(hosts, args, state):
@@ -719,6 +872,8 @@ def phase1_unauth(hosts, args, state):
     if not dc:
         log(f"{C.R}[!] Pas de DC identifie -> phase 1 limitee.{C.X}")
         return
+    # recon DNS (SRV/SOA/AXFR) : premiere etape du module HTB, avant tout le reste
+    dns_enum(dc, args.domain, state, args)
     # les 2 vecteurs SANS cred (proposes tot, jamais executes) + check ZeroLogon
     mitm6_responder_hint(state)
     cve_checks(args, state, dc, authed=False)
@@ -2843,11 +2998,11 @@ def parse_targets(target):
         return [target]
 
 # ----------------------------------------------------------------------
-__version__ = "2.0"
+__version__ = "2.1"        # V2 : + recon DNS (SRV/SOA/AXFR) aligne module HTB AD Enum & Attacks
 
 BANNER = f"""{C.CY}{C.BD}
-  adhunt.py v{__version__}  -  enumeration Active Directory (tableau de bord vivant){C.X}
-{C.GR}  users -> shares -> hashes -> crack -> creds   (escalade: --exploit){C.X}
+  adhunt.py v{__version__} {C.Y}[V2]{C.CY}  -  enumeration Active Directory (tableau de bord vivant){C.X}
+{C.GR}  DNS -> users -> shares -> hashes -> crack -> creds   (escalade: --exploit){C.X}
 {C.Y}  by 12akHack{C.GR}  -  tu fournis l'IP du DC (pas de scan nmap ici){C.X}
 {C.R}  [!] Usage AUTORISE uniquement : reste STRICTEMENT dans le scope.{C.X}
 """

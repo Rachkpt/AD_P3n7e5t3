@@ -28,6 +28,32 @@ if command -v pip3 >/dev/null 2>&1; then
     || echo -e "${Y}[i] pip a echoue -> installe 'ldap3 impacket' a la main si besoin.${X}"
 fi
 
+# 2bis) ARSENAL AD complet (optionnel) : --full ou variable ADHUNT_FULL=1
+#       netexec, certipy, bloodhound, responder, kerbrute, mitm6, enum4linux-ng...
+if [ "${1:-}" = "--full" ] || [ "${ADHUNT_FULL:-}" = "1" ]; then
+  echo -e "${G}[*] Installation de l'arsenal AD complet (peut prendre quelques minutes)...${X}"
+  if command -v apt >/dev/null 2>&1; then
+    APT=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" != 0 ] && APT=sudo
+    $APT apt update -y 2>/dev/null || true
+    # paquets Kali (souvent deja presents) : responder, kerbrute, mitm6, enum4linux-ng, hashcat, john
+    $APT apt install -y responder kerbrute mitm6 enum4linux-ng hashcat john \
+        bloodhound.py netexec 2>/dev/null \
+        || echo -e "${Y}[i] Certains paquets apt indisponibles -> pipx prend le relais.${X}"
+  fi
+  # pipx = installation propre et isolee des outils python (recommande sur Kali recent)
+  if command -v pipx >/dev/null 2>&1 || pip3 install --quiet --break-system-packages pipx 2>/dev/null; then
+    export PATH="$HOME/.local/bin:$PATH"
+    for tool in netexec certipy-ad impacket bloodhound-ce-python mitm6; do
+      pipx install "$tool" 2>/dev/null || pipx install --force "$tool" 2>/dev/null || true
+    done
+    pipx ensurepath 2>/dev/null || true
+  fi
+  echo -e "${G}[+] Arsenal AD installe (ce qui etait dispo).${X}"
+else
+  echo -e "${GR}[i] Astuce : ${X}./install.sh --full${GR}  installe TOUT l'arsenal AD "
+  echo -e "    (netexec, certipy, bloodhound, responder, kerbrute, mitm6...).${X}"
+fi
+
 # 3) choisit un dossier bin sur le PATH (system si possible, sinon ~/.local/bin)
 SUDO=""
 if [ -w /usr/local/bin ]; then

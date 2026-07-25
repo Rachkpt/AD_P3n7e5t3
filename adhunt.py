@@ -139,7 +139,7 @@ class Board:
             _raw("\n" + "=" * 60)                    # sortie redirigee : simple separateur
         dom = st.get("domain") or "?"
         dc = st.get("dc") or "?"
-        _raw(f"{C.CY}{C.BD}  adhunt  ::  domaine {dom}  ::  DC {dc}{C.X}")
+        _raw(f"{C.CY}{C.BD}  adhunt v{__version__}  ::  domaine {dom}  ::  DC {dc}{C.X}")
         # bandeau de compteurs vivants : ce qui a ete trouve jusqu'ici
         fs = st.get("findings") or []
         nc = sum(1 for f in fs if f["sev"] == "CRIT")
@@ -2843,8 +2843,10 @@ def parse_targets(target):
         return [target]
 
 # ----------------------------------------------------------------------
+__version__ = "2.0"
+
 BANNER = f"""{C.CY}{C.BD}
-  adhunt.py  -  enumeration Active Directory (tableau de bord vivant){C.X}
+  adhunt.py v{__version__}  -  enumeration Active Directory (tableau de bord vivant){C.X}
 {C.GR}  users -> shares -> hashes -> crack -> creds   (escalade: --exploit){C.X}
 {C.Y}  by 12akHack{C.GR}  -  tu fournis l'IP du DC (pas de scan nmap ici){C.X}
 {C.R}  [!] Usage AUTORISE uniquement : reste STRICTEMENT dans le scope.{C.X}
@@ -2875,7 +2877,7 @@ def intro_animation():
             time.sleep(0.045)
         except Exception:
             pass
-    _raw(f"     {C.CY}{C.BD}enumeration Active Directory{C.X}"
+    _raw(f"     {C.CY}{C.BD}enumeration Active Directory {C.Y}v{__version__}{C.X}"
          f"{C.GR}  -  tableau de bord vivant  -  by 12akHack{C.X}")
     try:                                    # petit spinner d'initialisation
         for _ in range(2):
@@ -2928,6 +2930,7 @@ def main():
  /!\\ Reste STRICTEMENT dans le scope autorise de l'engagement.
 ------------------------------------------------------------------------
 """)
+    p.add_argument("--version", action="version", version=f"adhunt v{__version__}  by 12akHack")
     p.add_argument("target", nargs="?", help="IP, CIDR, hostname ou fichier de cibles")
     p.add_argument("-d", "--domain", help="Domaine AD (ex: corp.local) - auto-detecte sinon")
     p.add_argument("-u", "--user", help="Utilisateur")

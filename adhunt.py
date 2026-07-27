@@ -257,6 +257,40 @@ def have_lib(name):
     except Exception:
         return False
 
+def augment_path():
+    """Sous `sudo`, la PATH est reduite (secure_path) et MASQUE les outils installes
+    en pip --user / pipx du vrai utilisateur (impacket GetNPUsers/GetUserSPNs/secretsdump,
+    certipy, bloodhound-python...). Sans ca : "GetNPUsers.py absent" alors qu'il marche
+    a la main -> AS-REP/Kerberoast/DCSync sautes en silence. On rajoute ses repertoires bin.
+    Retourne la liste des repertoires ajoutes (pour log/diagnostic)."""
+    if os.name != "posix":
+        return []
+    homes = []
+    su = os.environ.get("SUDO_USER")
+    if su:
+        try:
+            import pwd
+            homes.append(pwd.getpwnam(su).pw_dir)
+        except Exception:
+            homes.append(f"/home/{su}")
+    homes.append(os.path.expanduser("~"))
+    extra = ["/usr/local/bin", "/usr/local/sbin", "/opt/impacket/examples"]
+    for h in homes:
+        extra.append(os.path.join(h, ".local", "bin"))
+        pipx = os.path.join(h, ".local", "pipx", "venvs")
+        if os.path.isdir(pipx):
+            for v in os.listdir(pipx):
+                extra.append(os.path.join(pipx, v, "bin"))
+    cur = os.environ.get("PATH", "").split(os.pathsep)
+    added = []
+    for d in extra:
+        if d and os.path.isdir(d) and d not in cur:
+            cur.append(d)
+            added.append(d)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(cur)
+    return added
+
 # ----------------------------------------------------------------------
 # Ports AD d'interet
 # ----------------------------------------------------------------------
@@ -3231,6 +3265,10 @@ def main():
     except Exception:
         pass
 
+    # sous sudo : rajoute ~/.local/bin & pipx du vrai user pour retrouver impacket/certipy
+    # (DOIT tourner AVANT detect_env/have() sinon "GetNPUsers.py absent" a tort)
+    _pathadd = augment_path()
+
     intro_animation()
     if not args.target:
         p.print_help(); sys.exit(0)
@@ -3239,8 +3277,15 @@ def main():
     VERBOSE = args.verbose
 
     ext, libs = detect_env()
+    if _pathadd:
+        dbg(f"[i] PATH enrichie (sudo) : +{', '.join(_pathadd)}")
     dbg(f"[i] Outils externes : {', '.join(ext) if ext else 'aucun (fallback pur-python)'}")
     dbg(f"[i] Libs python     : {', '.join(libs) if libs else 'aucune (pip install ldap3 impacket)'}")
+    # avertissement clair si impacket reste introuvable (roast/DCSync impossibles)
+    if not have("GetNPUsers.py") and not have("impacket-GetNPUsers"):
+        log(f"{C.Y}[!] impacket introuvable dans la PATH (meme apres enrichissement sudo) : "
+            f"AS-REP roast / Kerberoast / DCSync seront sautes. "
+            f"Verifie 'which GetNPUsers.py' et lance sans sudo, ou installe impacket en root.{C.X}")
 
     targets = parse_targets(args.target)
     # dossier de sortie base sur le domaine (ou la cible)

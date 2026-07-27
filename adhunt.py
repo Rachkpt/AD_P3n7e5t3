@@ -2374,7 +2374,11 @@ def phase4_escalation(hosts, args, state):
 # CRACKING (hashcat/john) -> reinjecte les creds (la boucle CTF)
 # ======================================================================
 WORDLISTS = ["/usr/share/wordlists/rockyou.txt", "/usr/share/seclists/Passwords/rockyou.txt",
+             "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt",
              "rockyou.txt", os.path.expanduser("~/rockyou.txt")]
+# rockyou est livre COMPRESSE (.gz) par defaut sur Kali -> on le decompresse au besoin
+WORDLISTS_GZ = ["/usr/share/wordlists/rockyou.txt.gz",
+                "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt.gz"]
 
 def find_wordlist(args):
     if getattr(args, "wordlist", None) and os.path.isfile(args.wordlist):
@@ -2382,6 +2386,19 @@ def find_wordlist(args):
     for w in WORDLISTS:
         if os.path.isfile(w):
             return w
+    # rien de decompresse -> on cherche un .gz et on le decompresse UNE fois dans le loot
+    import gzip
+    for gz in WORDLISTS_GZ:
+        if os.path.isfile(gz):
+            dest = os.path.join(getattr(args, "loot", ".") or ".", "rockyou.txt")
+            try:
+                if not (os.path.isfile(dest) and os.path.getsize(dest) > 0):
+                    log(f"{C.GR}[i] rockyou livre en .gz -> decompression unique vers {dest}...{C.X}")
+                    with gzip.open(gz, "rb") as s, open(dest, "wb") as d:
+                        shutil.copyfileobj(s, d)
+                return dest
+            except Exception as e:
+                dbg(f"[!] decompression rockyou KO ({gz}): {e}")
     return None
 
 def _extract_cracked_user(hashline):

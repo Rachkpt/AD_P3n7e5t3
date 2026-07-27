@@ -769,23 +769,48 @@ def save_loot(args, name, content):
     return path
 
 def ldap_bind(args, dc_ip, timeout=6):
-    """Bind LDAP authentifie (ldap3, NTLM ou pass-the-hash)."""
+    """Bind LDAP authentifie ROBUSTE. Les DC modernes (2019+/2025) EXIGENT le LDAP
+    signing / channel binding -> un bind 389 en clair est rejete ('strongerAuthRequired').
+    On tente, dans l'ordre : (1) LDAP 389 + NTLM sealing (sign+seal, satisfait le signing),
+    (2) LDAPS 636 en TLS (satisfait le channel binding), (3) LDAP 389 simple (vieux DC).
+    NTLM ou pass-the-hash."""
     if not have_lib("ldap3"):
         return None
     if not args.user or (args.password is None and not args.nthash):
         log(f"{C.Y}[i] Bind LDAP saute : creds incompletes (-u + -p/-H requis).{C.X}")
         return None
+    import ssl
+    from ldap3 import Server, Connection, ALL, NTLM, Tls
     try:
-        from ldap3 import Server, Connection, ALL, NTLM
-        srv = Server(dc_ip, get_info=ALL, connect_timeout=timeout)
-        user = f"{args.domain}\\{args.user}"
-        pw = nt_full(args.nthash) if args.nthash else args.password
-        conn = Connection(srv, user=user, password=pw, authentication=NTLM,
-                          auto_bind=True, receive_timeout=timeout)
-        return conn
-    except Exception as e:
-        log(f"{C.GR}    (bind LDAP echoue : {e}){C.X}")
-        return None
+        from ldap3 import ENCRYPT
+    except Exception:
+        ENCRYPT = "ENCRYPT"
+    user = f"{args.domain}\\{args.user}"
+    pw = nt_full(args.nthash) if args.nthash else args.password
+    tls = Tls(validate=ssl.CERT_NONE)
+    attempts = [
+        ("LDAP 389 + sealing (NTLM sign+seal)",
+         Server(dc_ip, port=389, get_info=ALL, connect_timeout=timeout),
+         dict(authentication=NTLM, session_security=ENCRYPT)),
+        ("LDAPS 636 (TLS)",
+         Server(dc_ip, port=636, use_ssl=True, tls=tls, get_info=ALL, connect_timeout=timeout),
+         dict(authentication=NTLM)),
+        ("LDAP 389 simple",
+         Server(dc_ip, port=389, get_info=ALL, connect_timeout=timeout),
+         dict(authentication=NTLM)),
+    ]
+    last = None
+    for label, srv, kw in attempts:
+        try:
+            conn = Connection(srv, user=user, password=pw, auto_bind=True,
+                              receive_timeout=timeout, **kw)
+            dbg(f"[i] bind LDAP OK via {label}")
+            return conn
+        except Exception as e:
+            last = e
+            dbg(f"[!] bind LDAP KO ({label}) : {e}")
+    log(f"{C.GR}    (bind LDAP echoue [sealing/LDAPS/clair] : {last}){C.X}")
+    return None
 
 def ldap_search_all(conn, base, filt, attrs, controls=None, page=500):
     """Recherche LDAP AVEC pagination complete (cookie) : ne tronque plus a 500/1000.
@@ -1926,8 +1951,17 @@ def phase3_authenum(hosts, args, state):
     if have_lib("ldap3"):
         conn = ldap_bind(args, dc)
         if conn:
-            rd = ldap_rootdse(dc) or {}
-            base = rd.get("defaultNamingContext")
+            # base DN : depuis la connexion AUTHENTIFIEE (le rootDSE anonyme echoue sur
+            # DC durci), sinon deduit du domaine (checkpoint.htb -> DC=checkpoint,DC=htb)
+            base = None
+            try:
+                other = conn.server.info.other if conn.server.info else {}
+                dnc = other.get("defaultNamingContext")
+                base = dnc[0] if isinstance(dnc, (list, tuple)) and dnc else (dnc or None)
+            except Exception:
+                pass
+            if not base and args.domain:
+                base = ",".join(f"DC={p}" for p in args.domain.split("."))
             if base:
                 log(f"{C.GR}[i] Dump LDAP ({base})...{C.X}")
                 try:

